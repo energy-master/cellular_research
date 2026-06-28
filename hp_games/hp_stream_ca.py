@@ -224,7 +224,7 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
                dry_run: bool = False, limit: int | None = None,
                smallest_first: bool = False, output_root: str | None = None,
                timeout: int = 1800, max_size_mb: float | None = None,
-               retries: int = 3) -> tuple[str, list[FileOutcome]]:
+               retries: int = 3, progress: bool = True) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every WAV in the ``hp`` stream into one root folder.
 
     Creates the random root output folder, processes each file into its own
@@ -249,6 +249,7 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         max_size_mb: Skip files larger than this many MB (``None`` = no cap).
             Useful to bound a "whole stream" run away from the few huge files.
         retries: Fetch attempts per file before recording it as failed.
+        progress: Show a CLI download progress bar for each WAV fetch.
 
     Returns:
         ``(root, outcomes)`` — the root folder path and one
@@ -259,6 +260,7 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
     """
     client = make_client(base_url, token)
     client.timeout = timeout  # large WAVs need far more than the 120 s default
+    client.progress = progress  # CLI download bar for the multi-GB WAV fetches
     folder = resolve_stream(client, stream)
     wavs = list_stream_wavs(client, folder, smallest_first=smallest_first)
     if limit is not None:
@@ -327,6 +329,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="skip files larger than this many MB (default: no cap)")
     p.add_argument("--retries", type=int, default=3,
                    help="fetch attempts per file before recording it as failed")
+    p.add_argument("--no-progress", dest="progress", action="store_false",
+                   help="hide the per-file download progress bar")
     p.add_argument("--evolve-steps", type=int, default=None,
                    help="CA generations to render per file (default: same as --steps)")
     p.add_argument("--no-render", dest="render", action="store_false",
@@ -361,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             max_size_mb=args.max_size_mb,
             retries=args.retries,
+            progress=args.progress,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_stream_ca] error: {type(exc).__name__}: {exc}")
