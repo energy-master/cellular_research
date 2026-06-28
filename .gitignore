@@ -33,3 +33,9 @@ secrets.*
 *.npy
 *.npz
 data/
+
+# --- CA-evolution render bundles (regenerate via hp_ca / cellular_automata) ---
+renders/
+*.png
+*.mp4
+*.gif

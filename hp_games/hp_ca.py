@@ -78,6 +78,10 @@ SAVED_FILE = "_20090817_133217_000_WTT20090817_133137.wav"
 #: Model label recorded against the run in ident db.
 MODEL_NAME = "hp_ca"
 
+#: Root folder under which CA-evolution render bundles are written
+#: (one ``<run_id>/`` bundle per run; drop it into the app to view).
+BUNDLE_ROOT = "renders"
+
 
 # --- Result container ---------------------------------------------------------
 
@@ -98,6 +102,8 @@ class RunOutcome:
         posted: ``True`` if the run was written to ident db, ``False`` on a dry
             run.
         response: Raw server response from ``post_run`` (``None`` on a dry run).
+        bundle_dir: Path to the CA-evolution render bundle, or ``None`` if not
+            rendered.
     """
 
     run_id: str
@@ -109,6 +115,7 @@ class RunOutcome:
     threshold: float
     posted: bool
     response: dict | None = None
+    bundle_dir: str | None = None
 
     def as_dict(self) -> dict:
         """Return a plain ``dict`` view of this outcome for logging/JSON."""
@@ -122,6 +129,7 @@ class RunOutcome:
             "threshold": self.threshold,
             "posted": self.posted,
             "response": self.response,
+            "bundle_dir": self.bundle_dir,
         }
 
 
@@ -284,13 +292,29 @@ def fourier_for_saved_file(client: Client, file_id: int) -> dict:
         }
 
 
+def build_rule(steps: int = 3):
+    """Build the ``hp_ca`` CA rule chain.
+
+    Pairs a Wolfram rule 90 pass (XOR — emphasises harmonic periodicity, well
+    suited to tonal sonar/acoustic content) with a local z-score anomaly detector
+    and connected-component grouping. Shared by the detection pipeline and the
+    evolution render so the visualization is faithful to what scored detections.
+
+    Args:
+        steps: Number of CA evolution steps. Defaults to ``3``.
+
+    Returns:
+        A ``brahma_cellular`` rule chain (``CARule``).
+    """
+    return (
+        WolframRule(rule_number=90, steps=steps)
+        | AnomalyDetectionRule(min_sigma=1.5)
+        | GroupingRule()
+    )
+
+
 def build_pipeline(steps: int = 3, threshold: float = 0.45) -> Pipeline:
     """Build the CA pipeline for the ``hp_ca`` model.
-
-    The rule chain pairs a Wolfram rule 90 pass (XOR — emphasises harmonic
-    periodicity, well suited to tonal sonar/acoustic content) with a local
-    z-score anomaly detector and connected-component grouping. The pipeline
-    labels detections with the default frequency-band map.
 
     Args:
         steps: Number of CA evolution steps. Defaults to ``3``.
@@ -300,18 +324,56 @@ def build_pipeline(steps: int = 3, threshold: float = 0.45) -> Pipeline:
     Returns:
         A configured :class:`brahma_cellular.Pipeline`.
     """
-    rule = (
-        WolframRule(rule_number=90, steps=steps)
-        | AnomalyDetectionRule(min_sigma=1.5)
-        | GroupingRule()
-    )
     return Pipeline(
-        rule=rule,
+        rule=build_rule(steps),
         model_name=MODEL_NAME,
         steps=steps,
         threshold=threshold,
         label=True,
     )
+
+
+def render_evolution(fourier: dict, steps: int, out_dir: str,
+                     source: dict | None = None, fps: int = 8):
+    """Render the CA grid evolution for this run into a drop-in bundle.
+
+    Uses the SDK's :class:`identdynamics.cellular_automata.cellular_automata` to
+    evolve the same rule chain over the spectrogram with history captured, and
+    write a ``ca-evolution/1`` bundle (per-generation PNG frames + ``evolution.mp4``
+    + ``manifest.json``). Dropping ``out_dir`` into the IDent Dynamics app
+    auto-mounts the CA Evolution panel.
+
+    Rendering is best-effort: if the optional render dependencies (matplotlib /
+    Pillow, imported lazily by the SDK class) are missing, this logs and returns
+    ``None`` rather than failing the run.
+
+    Args:
+        fourier: The run's Fourier grid.
+        steps: CA generations to evolve and render.
+        out_dir: Destination bundle folder.
+        source: Provenance recorded in the manifest.
+        fps: Playback frame rate for the merged video.
+
+    Returns:
+        The manifest dict on success, else ``None``.
+    """
+    try:
+        from identdynamics.cellular_automata import cellular_automata
+    except ImportError as exc:  # SDK without the CA module
+        print(f"[hp_ca] evolution render skipped (import): {exc}")
+        return None
+    try:
+        renderer = cellular_automata(cmap="viridis", fps=fps)
+        manifest = renderer.render_fourier(
+            fourier, build_rule(steps), steps, out_dir,
+            model_name=MODEL_NAME, source=source,
+        )
+    except ImportError as exc:  # matplotlib / Pillow not installed
+        print(f"[hp_ca] evolution render skipped (deps): {exc}")
+        return None
+    print(f"[hp_ca] CA evolution bundle: {out_dir} "
+          f"({manifest['n_steps']} frames, video={manifest['video']})")
+    return manifest
 
 
 def new_run_id() -> str:
@@ -327,7 +389,9 @@ def new_run_id() -> str:
 def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
               stream: str = STREAM_NAME, select: str = "smallest",
               file: str | None = None, steps: int = 3,
-              threshold: float = 0.45, dry_run: bool = False) -> RunOutcome:
+              threshold: float = 0.45, dry_run: bool = False,
+              render: bool = True, evolve_steps: int | None = None,
+              bundle_root: str = BUNDLE_ROOT) -> RunOutcome:
     """Execute one CA run over one ``hp`` stream file and save it to ident db.
 
     This is the top-level orchestrator: authenticate, resolve the stream, select
@@ -344,6 +408,11 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
         steps: CA evolution steps.
         threshold: Detection threshold.
         dry_run: If ``True``, run the CA but do not post to ident db.
+        render: If ``True``, also write a CA-evolution render bundle (drop into
+            the app to watch the grid evolve). Independent of ``dry_run``.
+        evolve_steps: CA generations to render for the bundle; defaults to
+            ``steps`` so the visualization matches the detection run.
+        bundle_root: Folder under which the ``<run_id>/`` bundle is written.
 
     Returns:
         A :class:`RunOutcome` describing the run and (unless ``dry_run``) the
@@ -399,6 +468,16 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
         posted=False,
     )
 
+    if render:
+        out_dir = os.path.join(bundle_root, run_id)
+        manifest = render_evolution(
+            fourier, evolve_steps if evolve_steps is not None else steps, out_dir,
+            source={"stream": folder, "file": name, "run_id": run_id,
+                    "rule": "WolframRule(90) | AnomalyDetectionRule | GroupingRule"},
+        )
+        if manifest is not None:
+            outcome.bundle_dir = out_dir
+
     if dry_run:
         print("[hp_ca] dry-run: not posting to ident db")
         return outcome
@@ -431,6 +510,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--threshold", type=float, default=0.45, help="detection threshold")
     p.add_argument("--dry-run", action="store_true",
                    help="run the CA but do not post to ident db")
+    p.add_argument("--no-render", dest="render", action="store_false",
+                   help="skip writing the CA-evolution render bundle")
+    p.add_argument("--evolve-steps", type=int, default=None,
+                   help="CA generations to render (default: same as --steps)")
+    p.add_argument("--bundle-root", default=BUNDLE_ROOT,
+                   help="folder to write the <run_id>/ render bundle under")
     return p.parse_args(argv)
 
 
@@ -452,6 +537,9 @@ def main(argv: list[str] | None = None) -> int:
             steps=args.steps,
             threshold=args.threshold,
             dry_run=args.dry_run,
+            render=args.render,
+            evolve_steps=args.evolve_steps,
+            bundle_root=args.bundle_root,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_ca] error: {type(exc).__name__}: {exc}")
