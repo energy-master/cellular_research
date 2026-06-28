@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+
+""" Vixen Intelligence c.2026"""
+
 """hp_ca — first cellular-automata run against the IDent Dynamics ``hp`` stream.
 
 This module is the minimal end-to-end framework for ``hp_ca``: the inaugural run
