@@ -65,7 +65,7 @@ STREAM_USER = "rdtandon"
 #: lives in source / git history. Export it before running, e.g.::
 #:
 #:     export IDENT_API_KEY="<your-token>"
-API_KEY = os.environ.get("IDENT_API_KEY", "")
+API_KEY = os.environ.get("IDENT_API_KEY", "1e3464d23383b10c52515ab7978e4d7ff8fca3e982ba1202c5be6677ea290c48")
 
 #: Name of the stream folder to draw the single run file from.
 STREAM_NAME = "hp"
@@ -575,7 +575,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="file selection strategy when --file is omitted")
     p.add_argument("--file", default=None, help="explicit stream file to run on")
     p.add_argument("--steps", type=int, default=3, help="CA evolution steps")
-    p.add_argument("--threshold", type=float, default=0.45, help="detection threshold")
+    p.add_argument("--threshold", type=float, default=0.6, help="detection threshold")
     p.add_argument("--dry-run", action="store_true",
                    help="run the CA but do not post to ident db")
     p.add_argument("--no-render", dest="render", action="store_false",
@@ -595,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     """Script entry point. Returns a process exit code.
 
     Args:
+    
         argv: Optional argument vector (defaults to ``sys.argv[1:]``).
 
     Returns:
