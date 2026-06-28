@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Claude / local tooling / editor ---
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.idea/
+.vscode/
+.DS_Store
+
+# --- Secrets / credentials ---
+.env
+.env.*
+*.secret
+secrets.*
+**/secrets/
+
+# --- Data / audio (kept out of git; pulled from the stream / saved files) ---
+*.wav
+*.flac
+*.aif
+*.aiff
+*.mp3
+*.npy
+*.npz
+data/
