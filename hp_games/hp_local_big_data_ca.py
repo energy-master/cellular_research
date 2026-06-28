@@ -16,17 +16,23 @@ Each file gets the same per-file output as the stream runner -- a self-contained
         <file-stem-1>/  manifest.json, frames/, evolution.mp4
         <file-stem-2>/  ...
 
-After processing, the whole run is registered as a **Work Project** in ident db
-via the SDK (``save_run_project``): the folder + each file's detection intervals
-are saved so the run shows up in the app's *Work projects* list. Re-attach the
-same local folder in the app and the decisions render overlaid on each file -- no
-audio is uploaded, only the decisions.
+After processing, the detections are saved two ways (both on by default):
+
+* **ident db** — the whole run is registered as one **Work Project**
+  (``save_run_project``): the folder + each file's detection intervals, so it
+  loads in a single click from the app's *Work projects* list rather than
+  file-by-file in Local Runs. No audio is uploaded, only the decisions.
+* **input folder** — a ``<base>.decisions.json`` sidecar is written next to each
+  audio file (``save_decisions_local``), so re-opening that folder in the app
+  overlays the detections in place, fully offline.
 
 Run it directly::
 
-    python hp_local_big_data_ca.py /path/to/folder
-    python hp_local_big_data_ca.py /path/to/folder --limit 5     # smoke test
-    python hp_local_big_data_ca.py /path/to/folder --dry-run     # render only, no project
+    python hp_local_big_data_ca.py /path/to/folder              # db + folder
+    python hp_local_big_data_ca.py /path/to/folder --limit 5    # smoke test
+    python hp_local_big_data_ca.py /path/to/folder --no-save-folder   # db only
+    python hp_local_big_data_ca.py /path/to/folder --no-save-db       # sidecars only
+    python hp_local_big_data_ca.py /path/to/folder --dry-run   # render only, no saves
 
 Note:
     The default band (:data:`hp_ca.FREQ_BAND`, 100-150 kHz) only selects bins on
@@ -42,7 +48,7 @@ import os
 import uuid
 from dataclasses import dataclass, asdict
 
-from identdynamics import ApiError, list_local_audio_files
+from identdynamics import ApiError, list_local_audio_files, save_decisions_local
 from hp_ca import (
     BASE_URL,
     API_KEY,
@@ -132,8 +138,8 @@ def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
 
 def process_file(path: str, folder: str, root: str, steps: int, threshold: float,
                  freq_band: tuple[float, float], render: bool,
-                 evolve_steps: int | None) -> tuple[FileOutcome, dict | None]:
-    """Run the band-limited CA on one local file; render + collect decisions.
+                 evolve_steps: int | None) -> tuple[FileOutcome, list | None]:
+    """Run the band-limited CA on one local file; render + collect detections.
 
     Args:
         path: Absolute path to the audio file.
@@ -146,10 +152,11 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
         evolve_steps: Generations to render (defaults to ``steps``).
 
     Returns:
-        ``(outcome, per_file_entry)`` where ``per_file_entry`` is the
-        ``save_run_project`` record (``{"name","path","detections"}`` with
-        ``detections`` as ``(start_sec, end_sec)`` tuples), or ``None`` on error.
-        Per-file failures are captured in ``outcome.error`` rather than raised.
+        ``(outcome, detections)`` where ``detections`` is the raw list of
+        detection dicts (``start``/``start_sec``/``end_sec``/``fmin``/``fmax``/…),
+        or ``None`` on error. The caller turns these into the Work Project record
+        (db) and/or the per-file decision sidecar (folder). Per-file failures are
+        captured in ``outcome.error`` rather than raised.
     """
     name = os.path.basename(path)
     rel = os.path.relpath(path, folder)
@@ -188,15 +195,8 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
                         "rule": "WolframRule(90) | AnomalyDetectionRule | GroupingRule"},
             )
 
-        # Decisions for the Work Project: detection intervals in seconds.
-        entry = {
-            "name": name,
-            "path": rel,
-            "detections": [(float(d["start_sec"]), float(d["end_sec"]))
-                           for d in detections],
-        }
         print(f"[hp_local] {rel}: {outcome.n_detections} detections, run_id={run_id}")
-        return outcome, entry
+        return outcome, detections
     except (ApiError, ValueError, KeyError, OSError) as exc:
         outcome.error = f"{type(exc).__name__}: {exc}"
         print(f"[hp_local] {rel}: ERROR {outcome.error}")
@@ -209,13 +209,20 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               evolve_steps: int | None = None, dry_run: bool = False,
               limit: int | None = None, output_root: str | None = None,
               project_name: str | None = None,
-              save_project: bool = True) -> tuple[str, list[FileOutcome]]:
-    """Run the CA over every audio file in a local folder and save a project.
+              save_db: bool = True,
+              save_folder: bool = True) -> tuple[str, list[FileOutcome]]:
+    """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
-    writes an ``index.json``, and (unless ``dry_run`` or ``save_project`` is off)
-    registers the whole run as a Work Project in ident db so the decisions are
-    viewable from the project in the app.
+    writes an ``index.json``, and saves the detections two ways (both on by
+    default, both skipped on a dry run):
+
+    * **ident db** (``save_db``) — registers the whole run as one **Work Project**
+      so it loads in a single click from the app's *Work projects* panel (the
+      folder + every file's detection intervals), rather than file-by-file.
+    * **input folder** (``save_folder``) — writes a ``<base>.decisions.json``
+      sidecar next to each audio file, so re-opening the folder in the app
+      overlays the detections in place (no server round-trip).
 
     Args:
         folder: Local folder to scan for audio.
@@ -226,11 +233,12 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         freq_band: ``(fmin, fmax)`` Hz band the CA is restricted to.
         render: Whether to write per-file evolution bundles.
         evolve_steps: Generations to render (defaults to ``steps``).
-        dry_run: If ``True``, render but do not save the project to ident db.
+        dry_run: If ``True``, render but do not write to db or the folder.
         limit: Process at most this many files (``None`` = all).
         output_root: Explicit root output folder (random if omitted).
         project_name: Work Project name (defaults to the folder basename).
-        save_project: Whether to register the Work Project (skipped on dry runs).
+        save_db: Register the run as a Work Project in ident db.
+        save_folder: Write a decision sidecar next to each audio file.
 
     Returns:
         ``(root, outcomes)`` -- the root output folder and one
@@ -248,18 +256,47 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
 
     root = output_root or new_output_root()
     os.makedirs(root, exist_ok=True)
-    print(f"[hp_local] folder={folder!r} files={len(files)} -> root={root!r}")
+    band_label = f"{int(freq_band[0])}-{int(freq_band[1])} Hz"
+    print(f"[hp_local] folder={folder!r} files={len(files)} -> root={root!r} "
+          f"(save_db={save_db}, save_folder={save_folder})")
 
     outcomes: list[FileOutcome] = []
     per_file: list[dict] = []
     first_stft: dict | None = None
+    n_sidecars = 0
     for i, path in enumerate(files, 1):
-        print(f"[hp_local] ({i}/{len(files)}) {os.path.relpath(path, folder)}")
-        outcome, entry = process_file(
+        rel = os.path.relpath(path, folder)
+        print(f"[hp_local] ({i}/{len(files)}) {rel}")
+        outcome, dets = process_file(
             path, folder, root, steps, threshold, freq_band, render, evolve_steps)
         outcomes.append(outcome)
-        if entry is not None:
-            per_file.append(entry)
+        if dets is None:
+            continue
+        name = os.path.basename(path)
+
+        # Work Project record (db): detection intervals in seconds.
+        per_file.append({
+            "name": name, "path": rel,
+            "detections": [(float(d["start_sec"]), float(d["end_sec"])) for d in dets],
+        })
+
+        # Decision sidecar (folder): one point-in-time record per detection,
+        # written next to the audio so the app pairs it on folder-open.
+        if save_folder and not dry_run and dets:
+            records = [{
+                "dt": float(d["start_sec"]),
+                "signature": MODEL_NAME,
+                "decision": "ident",
+                "reason": "ca band detection",
+                "frame": int(d.get("start", 0)),
+                "active_freq": band_label,
+            } for d in dets]
+            try:
+                save_decisions_local(os.path.dirname(path),
+                                     [{"name": name, "decisions": records}])
+                n_sidecars += 1
+            except OSError as exc:
+                print(f"[hp_local] {rel}: sidecar write failed: {exc}")
 
     # Use the first decoded file's STFT for the project's display spectrogram.
     for o in outcomes:
@@ -270,9 +307,9 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             except Exception:
                 first_stft = None
 
-    client = make_client(base_url, token)
     project = None
-    if save_project and not dry_run and per_file:
+    if save_db and not dry_run and per_file:
+        client = make_client(base_url, token)
         project = client.save_run_project(
             folder=folder,
             per_file=per_file,
@@ -281,9 +318,11 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             stft=first_stft,
         )
         print(f"[hp_local] saved Work Project to ident db: {project}")
-    elif dry_run:
-        print(f"[hp_local] dry-run: not saving project "
-              f"({len(per_file)} files would be saved)")
+    if dry_run:
+        print(f"[hp_local] dry-run: not saving "
+              f"({len(per_file)} files would go to db; sidecars skipped)")
+    elif save_folder:
+        print(f"[hp_local] wrote {n_sidecars} decision sidecar(s) into {folder}")
 
     index = {
         "folder": folder,
@@ -291,6 +330,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         "band_hz": [float(freq_band[0]), float(freq_band[1])],
         "n_files": len(outcomes),
         "n_failed": sum(1 for o in outcomes if o.error),
+        "n_sidecars": n_sidecars,
         "project": project,
         "files": [asdict(o) for o in outcomes],
     }
@@ -304,7 +344,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the script entry point."""
     p = argparse.ArgumentParser(
-        description="Run the hp_ca CA over a local folder and save as a Work Project.")
+        description="Run the hp_ca CA over a local folder; save as a Work Project "
+                    "(db) and/or write decision sidecars into the folder.")
     p.add_argument("folder", help="local folder of audio to process")
     p.add_argument("--steps", type=int, default=3, help="CA evolution steps")
     p.add_argument("--threshold", type=float, default=0.45, help="detection threshold")
@@ -322,10 +363,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CA generations to render per file (default: same as --steps)")
     p.add_argument("--no-render", dest="render", action="store_false",
                    help="skip writing per-file evolution bundles")
-    p.add_argument("--no-save", dest="save_project", action="store_false",
-                   help="skip registering the Work Project in ident db")
+    p.add_argument("--no-save-db", dest="save_db", action="store_false",
+                   help="skip registering the run as a Work Project in ident db")
+    p.add_argument("--no-save-folder", dest="save_folder", action="store_false",
+                   help="skip writing decision sidecars into the input folder")
     p.add_argument("--dry-run", action="store_true",
-                   help="render bundles but do not save the project")
+                   help="render bundles but do not save to db or the folder")
     return p.parse_args(argv)
 
 
@@ -344,7 +387,8 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             output_root=args.output_root,
             project_name=args.project_name,
-            save_project=args.save_project,
+            save_db=args.save_db,
+            save_folder=args.save_folder,
         )
     except (ApiError, NotADirectoryError, ValueError) as exc:
         print(f"[hp_local] error: {type(exc).__name__}: {exc}")
