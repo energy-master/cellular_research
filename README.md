@@ -25,4 +25,5 @@ Shared virtualenv at `~/dev/ident_games` with:
 
 ```bash
 pip install "brahma_cellular[identdynamics] @ git+https://github.com/energy-master/brahma_cellular"
+pip install "identdynamics @ git+https://github.com/energy-master/identdynamics-sdk.git#subdirectory=python"
 ```
