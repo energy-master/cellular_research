@@ -80,6 +80,11 @@ MODEL_NAME = "hp_ca"
 #: (one ``<run_id>/`` bundle per run; drop it into the app to view).
 BUNDLE_ROOT = "renders"
 
+#: Frequency band (Hz) attached to every CA detection as ``fmin``/``fmax``, so
+#: detections render as boxes spanning this band rather than the full height.
+#: Initial range 100–150 kHz (within the 500 kHz saved file's 250 kHz Nyquist).
+FREQ_BAND = (100000.0, 150000.0)
+
 
 # --- Result container ---------------------------------------------------------
 
@@ -290,6 +295,50 @@ def fourier_for_saved_file(client: Client, file_id: int) -> dict:
         }
 
 
+def crop_fourier_band(fourier: dict, fmin: float, fmax: float) -> dict:
+    """Crop a Fourier grid to a frequency band, returning a new Fourier dict.
+
+    Selects only the FFT bins whose centre frequency falls in ``[fmin, fmax]`` and
+    slices the magnitude grid to them, so a CA run over the result evolves across
+    far fewer cells (faster) and covers only the band. The frame axis and STFT
+    params are unchanged, so per-frame scores and detection times still line up
+    with the full file; ``bin_offset`` records the first kept bin for reference.
+
+    Args:
+        fourier: A Fourier dict (``magnitudes``/``frames``/``bins``/``stft``).
+        fmin: Band lower edge in Hz.
+        fmax: Band upper edge in Hz.
+
+    Returns:
+        A new Fourier dict restricted to the band (plus a ``bin_offset`` key). If
+        the band selects no bins, the original grid is returned unchanged.
+    """
+    import numpy as np
+
+    frames = int(fourier["frames"])
+    bins = int(fourier["bins"])
+    stft = fourier.get("stft", {})
+    fft = int(stft.get("fft", 1024))
+    sr = float(stft.get("sample_rate", fourier.get("sample_rate", 44100)))
+    bin_hz = np.arange(bins) * (sr / fft)
+
+    lo = int(np.searchsorted(bin_hz, fmin, side="left"))
+    hi = int(np.searchsorted(bin_hz, fmax, side="right"))
+    lo = max(0, min(lo, bins))
+    hi = max(lo, min(hi, bins))
+    if hi <= lo:
+        return dict(fourier, bin_offset=0)  # band outside range -> keep full grid
+
+    grid = np.asarray(fourier["magnitudes"], dtype=np.float64).reshape(frames, bins)
+    cropped = grid[:, lo:hi]
+    out = dict(fourier)
+    out["magnitudes"] = cropped.ravel()
+    out["bins"] = int(cropped.shape[1])
+    out["frames"] = frames
+    out["bin_offset"] = lo
+    return out
+
+
 def build_rule(steps: int = 3):
     """Build the ``hp_ca`` CA rule chain.
 
@@ -389,7 +438,8 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
               file: str | None = None, steps: int = 3,
               threshold: float = 0.45, dry_run: bool = False,
               render: bool = True, evolve_steps: int | None = None,
-              bundle_root: str = BUNDLE_ROOT) -> RunOutcome:
+              bundle_root: str = BUNDLE_ROOT,
+              freq_band: tuple[float, float] = FREQ_BAND) -> RunOutcome:
     """Execute one CA run over one ``hp`` stream file and save it to ident db.
 
     This is the top-level orchestrator: authenticate, resolve the stream, select
@@ -411,6 +461,10 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
         evolve_steps: CA generations to render for the bundle; defaults to
             ``steps`` so the visualization matches the detection run.
         bundle_root: Folder under which the ``<run_id>/`` bundle is written.
+        freq_band: ``(fmin, fmax)`` in Hz. The spectrogram is cropped to this
+            band before the CA runs (fewer bins -> faster), detections are tagged
+            with it, and the render covers only the band. Defaults to
+            :data:`FREQ_BAND`.
 
     Returns:
         A :class:`RunOutcome` describing the run and (unless ``dry_run``) the
@@ -445,15 +499,30 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
     print(f"[hp_ca] fourier: {fourier['frames']} frames x {fourier['bins']} bins "
           f"@ {fourier['sample_rate']} Hz")
 
+    # Restrict the CA to the frequency band: the spectrogram is cropped to the
+    # band's bins, so the CA evolves over far fewer cells (faster) and both the
+    # detection and the evolution render cover only the band.
+    fmin, fmax = float(freq_band[0]), float(freq_band[1])
+    band_fourier = crop_fourier_band(fourier, fmin, fmax)
+    print(f"[hp_ca] band {fmin:.0f}-{fmax:.0f} Hz -> "
+          f"{band_fourier['bins']} of {fourier['bins']} bins")
+
     pipeline = build_pipeline(steps=steps, threshold=threshold)
-    result = pipeline.run(fourier)
+    result = pipeline.run(band_fourier)
     result.pop("_ca", None)  # CAState handle — not JSON-postable
 
     scores = result["scores"]
     detections = result["detections"]
+
+    # Tag each detection with the band it was found in (post_run forwards
+    # fmin/fmax; brahma_cellular itself emits none).
+    for det in detections:
+        det["fmin"] = fmin
+        det["fmax"] = fmax
+
     run_id = new_run_id()
     print(f"[hp_ca] CA run: {len(scores)} frames, {len(detections)} detections, "
-          f"run_id={run_id}")
+          f"band={fmin:.0f}-{fmax:.0f} Hz, run_id={run_id}")
 
     outcome = RunOutcome(
         run_id=run_id,
@@ -469,8 +538,9 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
     if render:
         out_dir = os.path.join(bundle_root, run_id)
         manifest = render_evolution(
-            fourier, evolve_steps if evolve_steps is not None else steps, out_dir,
+            band_fourier, evolve_steps if evolve_steps is not None else steps, out_dir,
             source={"stream": folder, "file": name, "run_id": run_id,
+                    "band_hz": [fmin, fmax],
                     "rule": "WolframRule(90) | AnomalyDetectionRule | GroupingRule"},
         )
         if manifest is not None:
@@ -514,6 +584,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CA generations to render (default: same as --steps)")
     p.add_argument("--bundle-root", default=BUNDLE_ROOT,
                    help="folder to write the <run_id>/ render bundle under")
+    p.add_argument("--freq-band", type=float, nargs=2, metavar=("FMIN", "FMAX"),
+                   default=list(FREQ_BAND),
+                   help="frequency band (Hz) to restrict the CA to "
+                        "(default: %d %d)" % (int(FREQ_BAND[0]), int(FREQ_BAND[1])))
     return p.parse_args(argv)
 
 
@@ -538,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
             render=args.render,
             evolve_steps=args.evolve_steps,
             bundle_root=args.bundle_root,
+            freq_band=(args.freq_band[0], args.freq_band[1]),
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_ca] error: {type(exc).__name__}: {exc}")
