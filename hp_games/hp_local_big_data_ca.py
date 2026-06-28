@@ -337,7 +337,10 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             records = [{
                 "dt": float(d["start_sec"]),
                 "signature": MODEL_NAME,
-                "decision": "ident",
+                # The app counts a decision toward the thumbnail-lane bar only
+                # when decision == "detection" (folder-run.js); use that so the
+                # normalised per-file detection bars render like streams do.
+                "decision": "detection",
                 "reason": "ca band detection",
                 "frame": int(d.get("start", 0)),
                 "active_freq": band_label,
