@@ -9,12 +9,15 @@ file -- no upload of the audio -- so a large local dataset can be processed
 without a server round-trip per file.
 
 Each file gets the same per-file output as the stream runner -- a self-contained
-``ca-evolution/1`` bundle under one random root folder, plus an ``index.json``::
+``ca-evolution/1`` bundle under one random root folder, plus an ``index.json``.
+By default that root is created *inside* the scanned acoustic-data folder
+(``--no-output-in-folder`` puts it in the cwd; ``--output-root`` overrides)::
 
-    <output-root>/
-        index.json
-        <file-stem-1>/  manifest.json, frames/, evolution.mp4
-        <file-stem-2>/  ...
+    <acoustic-data-folder>/
+        outputdata<rand>/
+            index.json
+            <file-stem-1>/  manifest.json, frames/, evolution.mp4
+            <file-stem-2>/  ...
 
 After processing, the detections are saved two ways (both on by default):
 
@@ -63,8 +66,9 @@ from hp_ca import (
     new_run_id,
 )
 
-#: Prefix for the random per-invocation root output folder.
-OUTPUT_PREFIX = "local_ca_out"
+#: Prefix for the random per-invocation root output folder (created inside the
+#: scanned acoustic-data folder, e.g. ``<folder>/outputdata1f0c9ab2/``).
+OUTPUT_PREFIX = "outputdata"
 
 
 @dataclass
@@ -242,7 +246,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               limit: int | None = None, output_root: str | None = None,
               project_name: str | None = None,
               save_db: bool = True, save_folder: bool = True,
-              max_size_mb: float | None = None) -> tuple[str, list[FileOutcome]]:
+              max_size_mb: float | None = None,
+              output_in_folder: bool = True) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
@@ -267,7 +272,10 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         evolve_steps: Generations to render (defaults to ``steps``).
         dry_run: If ``True``, render but do not write to db or the folder.
         limit: Process at most this many files (``None`` = all).
-        output_root: Explicit root output folder (random if omitted).
+        output_root: Explicit root output folder; overrides ``output_in_folder``.
+        output_in_folder: Place the random ``outputdata<rand>/`` root inside the
+            scanned acoustic-data folder (default). If ``False``, create it in the
+            current working directory instead.
         project_name: Work Project name (defaults to the folder basename).
         save_db: Register the run as a Work Project in ident db.
         save_folder: Write a decision sidecar next to each audio file.
@@ -292,7 +300,15 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     if limit is not None:
         files = files[:limit]
 
-    root = output_root or new_output_root()
+    # Default: create the random output root *inside* the acoustic-data folder
+    # (so the CA-evolution bundles sit with the data). --output-root overrides it;
+    # output_in_folder=False puts it in the current working directory instead.
+    if output_root:
+        root = output_root
+    elif output_in_folder:
+        root = os.path.join(folder, new_output_root())
+    else:
+        root = new_output_root()
     os.makedirs(root, exist_ok=True)
     band_label = f"{int(freq_band[0])}-{int(freq_band[1])} Hz"
     print(f"[hp_local] folder={folder!r} files={len(files)} -> root={root!r} "
@@ -414,7 +430,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="skip files larger than this many MB (decode loads the "
                         "whole WAV into RAM; default: no cap)")
     p.add_argument("--output-root", default=None,
-                   help="explicit root output folder (default: random local_ca_out<rand>)")
+                   help="explicit root output folder (overrides --output-in-folder)")
+    p.add_argument("--output-in-folder", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="create the random outputdata<rand> root inside the data "
+                        "folder (default); --no-output-in-folder uses the cwd")
     p.add_argument("--project-name", default=None,
                    help="Work Project name (default: folder basename)")
     p.add_argument("--evolve-steps", type=int, default=None,
@@ -448,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
             save_db=args.save_db,
             save_folder=args.save_folder,
             max_size_mb=args.max_size_mb,
+            output_in_folder=args.output_in_folder,
         )
     except (ApiError, NotADirectoryError, ValueError) as exc:
         print(f"[hp_local] error: {type(exc).__name__}: {exc}")
