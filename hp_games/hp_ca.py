@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-
-
-""" Vixen Intelligence c.2026"""
+# Vixen Intelligence c.2026
 
 """hp_ca — first cellular-automata run against the IDent Dynamics ``hp`` stream.
 
