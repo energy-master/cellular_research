@@ -120,12 +120,18 @@ def list_stream_wavs(client, folder: str, smallest_first: bool = False) -> list[
 
 def process_file(client, folder: str, entry: dict, root: str, steps: int,
                  threshold: float, freq_band: tuple[float, float], render: bool,
-                 evolve_steps: int | None, dry_run: bool) -> FileOutcome:
+                 evolve_steps: int | None, dry_run: bool,
+                 retries: int = 3) -> FileOutcome:
     """Run the band-limited CA on one stream file and save its results.
 
     Fetches the file's Fourier grid, crops it to ``freq_band``, evolves the CA,
     renders a per-file evolution bundle into ``<root>/<file-stem>/``, and (unless
     ``dry_run``) posts the run to ident db against the stream target.
+
+    The fetch is retried (the stream holds multi-gigabyte files, and a dropped
+    connection mid-download raises ``IncompleteRead``); any per-file failure is
+    captured in ``outcome.error`` and returned rather than raised, so one bad or
+    too-large file never aborts the whole stream.
 
     Args:
         client: Authenticated API client.
@@ -138,6 +144,7 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
         render: Whether to write the evolution bundle.
         evolve_steps: Generations to render (defaults to ``steps``).
         dry_run: If ``True``, do not post to ident db.
+        retries: Attempts to fetch the (large) WAV before giving up on the file.
 
     Returns:
         A :class:`FileOutcome`. Per-file failures are captured in ``error``
@@ -149,7 +156,18 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
     outcome = FileOutcome(file=name, out_dir=out_dir)
 
     try:
-        fourier = client.fourier_for_stream(folder, name)
+        fourier = None
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                fourier = client.fourier_for_stream(folder, name)
+                break
+            except Exception as exc:  # noqa: BLE001 -- retry transient fetch failures
+                last_exc = exc
+                print(f"[hp_stream_ca] {name}: fetch attempt {attempt}/{retries} "
+                      f"failed: {type(exc).__name__}: {exc}")
+        if fourier is None:
+            raise last_exc
         fmin, fmax = float(freq_band[0]), float(freq_band[1])
         band_fourier = crop_fourier_band(fourier, fmin, fmax)
         print(f"[hp_stream_ca] {name}: {fourier['frames']} frames, band "
@@ -193,7 +211,7 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
             outcome.posted = True
         print(f"[hp_stream_ca] {name}: {outcome.n_detections} detections, "
               f"run_id={run_id}, posted={outcome.posted}")
-    except (ApiError, ValueError, KeyError) as exc:
+    except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
         outcome.error = f"{type(exc).__name__}: {exc}"
         print(f"[hp_stream_ca] {name}: ERROR {outcome.error}")
     return outcome
@@ -204,8 +222,9 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
                threshold: float = 0.45, freq_band: tuple[float, float] = FREQ_BAND,
                render: bool = True, evolve_steps: int | None = None,
                dry_run: bool = False, limit: int | None = None,
-               smallest_first: bool = False,
-               output_root: str | None = None) -> tuple[str, list[FileOutcome]]:
+               smallest_first: bool = False, output_root: str | None = None,
+               timeout: int = 1800, max_size_mb: float | None = None,
+               retries: int = 3) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every WAV in the ``hp`` stream into one root folder.
 
     Creates the random root output folder, processes each file into its own
@@ -224,6 +243,12 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         limit: Process at most this many files (``None`` = all).
         smallest_first: Process files by ascending size.
         output_root: Explicit root folder; a random one is minted if omitted.
+        timeout: Per-request socket timeout (seconds). The stream's WAVs are
+            multi-gigabyte; the SDK default (120 s) is too short and causes an
+            ``IncompleteRead`` mid-download, so this defaults to 1800 s.
+        max_size_mb: Skip files larger than this many MB (``None`` = no cap).
+            Useful to bound a "whole stream" run away from the few huge files.
+        retries: Fetch attempts per file before recording it as failed.
 
     Returns:
         ``(root, outcomes)`` — the root folder path and one
@@ -233,6 +258,7 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         LookupError: If the stream is not available to the token.
     """
     client = make_client(base_url, token)
+    client.timeout = timeout  # large WAVs need far more than the 120 s default
     folder = resolve_stream(client, stream)
     wavs = list_stream_wavs(client, folder, smallest_first=smallest_first)
     if limit is not None:
@@ -241,14 +267,23 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
     root = output_root or new_output_root()
     os.makedirs(root, exist_ok=True)
     print(f"[hp_stream_ca] user={STREAM_USER} stream={folder!r} "
-          f"files={len(wavs)} -> root={root!r}")
+          f"files={len(wavs)} -> root={root!r} (timeout={timeout}s)")
 
+    cap_bytes = int(max_size_mb * 1024 * 1024) if max_size_mb else None
     outcomes: list[FileOutcome] = []
     for i, entry in enumerate(wavs, 1):
-        print(f"[hp_stream_ca] ({i}/{len(wavs)}) {entry['name']}")
+        size_mb = entry.get("size_bytes", 0) / 1e6
+        print(f"[hp_stream_ca] ({i}/{len(wavs)}) {entry['name']} ({size_mb:.0f} MB)")
+        if cap_bytes is not None and entry.get("size_bytes", 0) > cap_bytes:
+            stem = os.path.splitext(os.path.basename(entry["name"]))[0]
+            skipped = FileOutcome(file=entry["name"], out_dir=os.path.join(root, stem),
+                                  error=f"skipped: {size_mb:.0f} MB > {max_size_mb:.0f} MB cap")
+            print(f"[hp_stream_ca] {entry['name']}: {skipped.error}")
+            outcomes.append(skipped)
+            continue
         outcomes.append(process_file(
             client, folder, entry, root, steps, threshold, freq_band,
-            render, evolve_steps, dry_run,
+            render, evolve_steps, dry_run, retries=retries,
         ))
 
     index = {
@@ -257,13 +292,15 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         "band_hz": [float(freq_band[0]), float(freq_band[1])],
         "n_files": len(outcomes),
         "n_posted": sum(1 for o in outcomes if o.posted),
-        "n_failed": sum(1 for o in outcomes if o.error),
+        "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
+        "n_failed": sum(1 for o in outcomes if o.error and not o.error.startswith("skipped:")),
         "files": [asdict(o) for o in outcomes],
     }
     with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as fh:
         json.dump(index, fh, indent=2)
     print(f"[hp_stream_ca] done: {index['n_posted']} posted, "
-          f"{index['n_failed']} failed -> {root}/index.json")
+          f"{index['n_skipped']} skipped, {index['n_failed']} failed "
+          f"-> {root}/index.json")
     return root, outcomes
 
 
@@ -284,6 +321,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="process files by ascending size")
     p.add_argument("--output-root", default=None,
                    help="explicit root output folder (default: random stream_hp_out<rand>)")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="per-request socket timeout in seconds (large WAVs; default 1800)")
+    p.add_argument("--max-size-mb", type=float, default=None,
+                   help="skip files larger than this many MB (default: no cap)")
+    p.add_argument("--retries", type=int, default=3,
+                   help="fetch attempts per file before recording it as failed")
     p.add_argument("--evolve-steps", type=int, default=None,
                    help="CA generations to render per file (default: same as --steps)")
     p.add_argument("--no-render", dest="render", action="store_false",
@@ -315,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             smallest_first=args.smallest_first,
             output_root=args.output_root,
+            timeout=args.timeout,
+            max_size_mb=args.max_size_mb,
+            retries=args.retries,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_stream_ca] error: {type(exc).__name__}: {exc}")
