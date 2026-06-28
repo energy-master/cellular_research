@@ -46,6 +46,7 @@ import argparse
 import gc
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, asdict
 
@@ -92,6 +93,28 @@ class FileOutcome:
 def new_output_root(prefix: str = OUTPUT_PREFIX) -> str:
     """Mint a random root output folder name, e.g. ``local_ca_out1f0c9ab2``."""
     return f"{prefix}{uuid.uuid4().hex[:8]}"
+
+
+def _stage(rel: str, msg: str, since: float | None = None) -> float:
+    """Print a flushed per-file stage line and return a perf timestamp.
+
+    Each processing step (decode, STFT, CA evolve, render, …) logs through this so
+    progress is visible live — and, crucially, the last line survives a hard kill
+    (e.g. the OS OOM-killing a multi-gigabyte decode), pinpointing where it died.
+
+    Args:
+        rel: File label (path relative to the scanned folder).
+        msg: Stage description.
+        since: A timestamp from a previous call; if given, its elapsed seconds are
+            appended.
+
+    Returns:
+        A ``time.perf_counter()`` timestamp to pass as ``since`` next time.
+    """
+    now = time.perf_counter()
+    extra = f" [{now - since:.1f}s]" if since is not None else ""
+    print(f"[hp_local]   {rel}: {msg}{extra}", flush=True)
+    return now
 
 
 def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
@@ -165,15 +188,19 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
     out_dir = os.path.join(root, stem)
     outcome = FileOutcome(file=name, path=rel, out_dir=out_dir)
 
+    fmin, fmax = float(freq_band[0]), float(freq_band[1])
+    size_mb = os.path.getsize(path) / 1e6
+
     try:
+        t = _stage(rel, f"decoding + STFT ({size_mb:.0f} MB)")
         fourier = fourier_for_local(path)
-        fmin, fmax = float(freq_band[0]), float(freq_band[1])
         band_fourier = crop_fourier_band(fourier, fmin, fmax)
-        print(f"[hp_local] {rel}: {fourier['frames']} frames, band "
-              f"{fmin:.0f}-{fmax:.0f} Hz -> {band_fourier['bins']} of "
-              f"{fourier['bins']} bins")
+        t = _stage(rel, f"{fourier['frames']} frames x {fourier['bins']} bins "
+                        f"-> band {fmin:.0f}-{fmax:.0f} Hz ({band_fourier['bins']} bins)",
+                   since=t)
 
         pipeline = build_pipeline(steps=steps, threshold=threshold)
+        t = _stage(rel, f"evolving CA ({steps} steps)")
         result = pipeline.run(band_fourier)
         result.pop("_ca", None)
         detections = result["detections"]
@@ -185,8 +212,10 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
         outcome.run_id = run_id
         outcome.n_frames = len(result["scores"])
         outcome.n_detections = len(detections)
+        t = _stage(rel, f"{outcome.n_detections} detections", since=t)
 
         if render:
+            t = _stage(rel, "rendering evolution")
             render_evolution(
                 band_fourier,
                 evolve_steps if evolve_steps is not None else steps,
@@ -195,8 +224,10 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
                         "band_hz": [fmin, fmax],
                         "rule": "WolframRule(90) | AnomalyDetectionRule | GroupingRule"},
             )
+            _stage(rel, "rendered", since=t)
 
-        print(f"[hp_local] {rel}: {outcome.n_detections} detections, run_id={run_id}")
+        print(f"[hp_local] {rel}: {outcome.n_detections} detections, "
+              f"run_id={run_id}", flush=True)
         return outcome, detections
     except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
         outcome.error = f"{type(exc).__name__}: {exc}"
