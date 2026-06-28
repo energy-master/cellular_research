@@ -43,6 +43,7 @@ Note:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import uuid
@@ -197,7 +198,7 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
 
         print(f"[hp_local] {rel}: {outcome.n_detections} detections, run_id={run_id}")
         return outcome, detections
-    except (ApiError, ValueError, KeyError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
         outcome.error = f"{type(exc).__name__}: {exc}"
         print(f"[hp_local] {rel}: ERROR {outcome.error}")
         return outcome, None
@@ -209,8 +210,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               evolve_steps: int | None = None, dry_run: bool = False,
               limit: int | None = None, output_root: str | None = None,
               project_name: str | None = None,
-              save_db: bool = True,
-              save_folder: bool = True) -> tuple[str, list[FileOutcome]]:
+              save_db: bool = True, save_folder: bool = True,
+              max_size_mb: float | None = None) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
@@ -239,6 +240,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         project_name: Work Project name (defaults to the folder basename).
         save_db: Register the run as a Work Project in ident db.
         save_folder: Write a decision sidecar next to each audio file.
+        max_size_mb: Skip files larger than this many MB (``None`` = no cap).
+            Decoding loads the whole WAV into RAM, so this bounds peak memory.
 
     Returns:
         ``(root, outcomes)`` -- the root output folder and one
@@ -264,16 +267,29 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     print(f"[hp_local] folder={folder!r} files={len(files)} -> root={root!r} "
           f"(save_db={save_db}, save_folder={save_folder})")
 
+    cap_bytes = int(max_size_mb * 1024 * 1024) if max_size_mb else None
     outcomes: list[FileOutcome] = []
     per_file: list[dict] = []
     first_stft: dict | None = None
     n_sidecars = 0
     for i, path in enumerate(files, 1):
         rel = os.path.relpath(path, folder)
-        print(f"[hp_local] ({i}/{len(files)}) {rel}")
+        size_mb = os.path.getsize(path) / 1e6
+        print(f"[hp_local] ({i}/{len(files)}) {rel} ({size_mb:.0f} MB)")
+        if cap_bytes is not None and os.path.getsize(path) > cap_bytes:
+            # Decoding loads the whole WAV (+ float64 STFT) into RAM; cap the
+            # on-disk size so a few multi-GB files can't OOM the whole run.
+            stem = os.path.splitext(os.path.basename(path))[0]
+            skipped = FileOutcome(file=os.path.basename(path), path=rel,
+                                  out_dir=os.path.join(root, stem),
+                                  error=f"skipped: {size_mb:.0f} MB > {max_size_mb:.0f} MB cap")
+            print(f"[hp_local] {rel}: {skipped.error}")
+            outcomes.append(skipped)
+            continue
         outcome, dets = process_file(
             path, folder, root, steps, threshold, freq_band, render, evolve_steps)
         outcomes.append(outcome)
+        gc.collect()  # release the file's decoded signal/grid before the next
         if dets is None:
             continue
         name = os.path.basename(path)
@@ -333,15 +349,16 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         "model_name": MODEL_NAME,
         "band_hz": [float(freq_band[0]), float(freq_band[1])],
         "n_files": len(outcomes),
-        "n_failed": sum(1 for o in outcomes if o.error),
+        "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
+        "n_failed": sum(1 for o in outcomes if o.error and not o.error.startswith("skipped:")),
         "n_sidecars": n_sidecars,
         "project": project,
         "files": [asdict(o) for o in outcomes],
     }
     with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as fh:
         json.dump(index, fh, indent=2)
-    print(f"[hp_local] done: {index['n_files']} files, {index['n_failed']} failed "
-          f"-> {root}/index.json")
+    print(f"[hp_local] done: {index['n_files']} files, {index['n_skipped']} skipped, "
+          f"{index['n_failed']} failed -> {root}/index.json")
     return root, outcomes
 
 
@@ -359,6 +376,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(default: %d %d)" % (int(FREQ_BAND[0]), int(FREQ_BAND[1])))
     p.add_argument("--limit", type=int, default=None,
                    help="process at most N files (default: all)")
+    p.add_argument("--max-size-mb", type=float, default=None,
+                   help="skip files larger than this many MB (decode loads the "
+                        "whole WAV into RAM; default: no cap)")
     p.add_argument("--output-root", default=None,
                    help="explicit root output folder (default: random local_ca_out<rand>)")
     p.add_argument("--project-name", default=None,
@@ -393,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             project_name=args.project_name,
             save_db=args.save_db,
             save_folder=args.save_folder,
+            max_size_mb=args.max_size_mb,
         )
     except (ApiError, NotADirectoryError, ValueError) as exc:
         print(f"[hp_local] error: {type(exc).__name__}: {exc}")
