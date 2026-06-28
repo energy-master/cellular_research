@@ -251,6 +251,10 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     if not os.path.isdir(folder):
         raise NotADirectoryError(folder)
     files = list_local_audio_files(folder)
+    # Skip macOS AppleDouble companions (``._foo.wav``) that macOS writes beside
+    # each file on non-HFS volumes: they share the audio extension but are
+    # metadata, not audio, and fail to decode.
+    files = [p for p in files if not os.path.basename(p).startswith("._")]
     if limit is not None:
         files = files[:limit]
 
