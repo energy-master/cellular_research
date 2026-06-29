@@ -438,7 +438,8 @@ def render_evolution(fourier: dict, steps: int, out_dir: str,
 
 
 def write_decisions_sidecar(audio_path: str, name: str, model_name: str,
-                            band_label: str, detections: list) -> None:
+                            freq_band: tuple[float, float],
+                            detections: list) -> None:
     """Write (or merge into) a ``.decisions.json`` sidecar next to an audio file.
 
     If a sidecar already exists, records from other model signatures are
@@ -452,20 +453,28 @@ def write_decisions_sidecar(audio_path: str, name: str, model_name: str,
         model_name: Model signature; used as the ``signature`` field and as
             the key for merging (existing records with this signature are
             replaced, all others are kept).
-        band_label: Human-readable frequency band string written into each
-            record's ``active_freq`` field (e.g. ``"100000-150000 Hz"``).
+        freq_band: ``(fmin, fmax)`` Hz of the CA band, written into each
+            record as ``fmin_hz`` / ``fmax_hz`` and as the human-readable
+            ``active_freq`` label.
         detections: List of detection dicts with at least ``start_sec``,
-            ``end_sec``, and ``start`` keys (standard CA pipeline output).
+            ``end_sec``, ``start``, ``fmin``, and ``fmax`` keys (standard CA
+            pipeline output).
     """
     from identdynamics import save_decisions_local
 
+    fmin, fmax = float(freq_band[0]), float(freq_band[1])
+    band_label = f"{int(fmin)}-{int(fmax)} Hz"
+
     new_records = [{
         "dt": float(d["start_sec"]),
+        "end_sec": float(d["end_sec"]),
         "signature": model_name,
         "decision": "detection",
         "reason": "ca band detection",
         "frame": int(d.get("start", 0)),
         "active_freq": band_label,
+        "fmin_hz": float(d.get("fmin", fmin)),
+        "fmax_hz": float(d.get("fmax", fmax)),
     } for d in detections]
 
     sidecar_path = os.path.join(

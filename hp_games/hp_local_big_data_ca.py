@@ -402,7 +402,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         if save_folder and not dry_run and dets:
             try:
                 write_decisions_sidecar(os.path.dirname(path), name,
-                                        model_name, band_label, dets)
+                                        model_name, freq_band, dets)
                 n_sidecars += 1
             except OSError as exc:
                 print(f"[hp_local] {rel}: sidecar write failed: {exc}")
