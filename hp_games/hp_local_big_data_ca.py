@@ -9,15 +9,15 @@ file -- no upload of the audio -- so a large local dataset can be processed
 without a server round-trip per file.
 
 Each file gets the same per-file output as the stream runner -- a self-contained
-``ca-evolution/1`` bundle under one random root folder, plus an ``index.json``.
-By default that root is created *inside* the scanned acoustic-data folder
-(``--no-output-in-folder`` puts it in the cwd; ``--output-root`` overrides)::
+``ca-evolution/1`` bundle under one random ``outputdata<rand>/`` root, plus an
+``index.json``. The root is created in the current working directory by default
+(``--output-in-folder`` places it inside the scanned data folder instead;
+``--output-root`` overrides)::
 
-    <acoustic-data-folder>/
-        outputdata<rand>/
-            index.json
-            <file-stem-1>/  manifest.json, frames/, evolution.mp4
-            <file-stem-2>/  ...
+    outputdata<rand>/
+        index.json
+        <file-stem-1>/  manifest.json, frames/, evolution.mp4
+        <file-stem-2>/  ...
 
 After processing, the detections are saved two ways (both on by default):
 
@@ -247,7 +247,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               project_name: str | None = None,
               save_db: bool = True, save_folder: bool = True,
               max_size_mb: float | None = None,
-              output_in_folder: bool = True) -> tuple[str, list[FileOutcome]]:
+              output_in_folder: bool = False) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
@@ -273,9 +273,9 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         dry_run: If ``True``, render but do not write to db or the folder.
         limit: Process at most this many files (``None`` = all).
         output_root: Explicit root output folder; overrides ``output_in_folder``.
-        output_in_folder: Place the random ``outputdata<rand>/`` root inside the
-            scanned acoustic-data folder (default). If ``False``, create it in the
-            current working directory instead.
+        output_in_folder: If ``True``, place the random ``outputdata<rand>/`` root
+            inside the scanned acoustic-data folder. Default ``False`` -- create
+            it in the current working directory.
         project_name: Work Project name (defaults to the folder basename).
         save_db: Register the run as a Work Project in ident db.
         save_folder: Write a decision sidecar next to each audio file.
@@ -432,9 +432,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-root", default=None,
                    help="explicit root output folder (overrides --output-in-folder)")
     p.add_argument("--output-in-folder", action=argparse.BooleanOptionalAction,
-                   default=True,
+                   default=False,
                    help="create the random outputdata<rand> root inside the data "
-                        "folder (default); --no-output-in-folder uses the cwd")
+                        "folder; default is the current working directory")
     p.add_argument("--project-name", default=None,
                    help="Work Project name (default: folder basename)")
     p.add_argument("--evolve-steps", type=int, default=None,
