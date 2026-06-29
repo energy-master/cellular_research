@@ -246,7 +246,8 @@ def select_saved_file(client: Client, name: str = SAVED_FILE) -> dict:
     raise ValueError(f"saved file {name!r} not found on this account")
 
 
-def fourier_for_saved_file(client: Client, file_id: int) -> dict:
+def fourier_for_saved_file(client: Client, file_id: int,
+                           desired_delta_t: float | None = None) -> dict:
     """Fourier grid for a saved file, tolerant of IEEE-float WAVs.
 
     ``Client.fourier_for_file`` decodes via the stdlib :mod:`wave` module, which
@@ -256,43 +257,55 @@ def fourier_for_saved_file(client: Client, file_id: int) -> dict:
     float samples, then runs the *same* reference STFT with the file's canonical
     parameters so the magnitudes line up with ``fourier_for_file``.
 
+    When ``desired_delta_t`` is given, the scipy fallback path is used
+    unconditionally so the hop can be set to
+    ``round(desired_delta_t * sample_rate)``; the SDK primary path does not
+    expose a hop override.
+
     Args:
         client: Authenticated API client.
         file_id: Saved file id.
+        desired_delta_t: Target time resolution in seconds between spectrogram
+            frames.  Forces the scipy decode path and overrides the canonical
+            hop with ``round(desired_delta_t * sample_rate)``.
 
     Returns:
         The standard Fourier dict ``{magnitudes, frames, bins, sample_rate,
         stft}``.
     """
-    try:
-        return client.fourier_for_file(file_id)
-    except Exception as exc:  # noqa: BLE001 — fall back only on a decode failure
-        import io
-        import numpy as np
-        from scipy.io import wavfile
-        from identdynamics import stft
+    if desired_delta_t is None:
+        try:
+            return client.fourier_for_file(file_id)
+        except Exception as exc:  # noqa: BLE001 — fall back only on a decode failure
+            print(f"[hp_ca] float-WAV fallback decode ({exc})")
 
-        params = client.stft_params(file_id=file_id)["canonical_stft"]
-        sample_rate, data = wavfile.read(io.BytesIO(client.file_wav(file_id)))
-        signal = data.astype(np.float64)
-        if np.issubdtype(data.dtype, np.integer):
-            signal /= float(np.iinfo(data.dtype).max)  # PCM -> [-1, 1]
-        if signal.ndim > 1:
-            signal = signal.mean(axis=1)  # mix to mono, matching the SDK
-        mags, frames, bins = stft(
-            signal, params["fft_size"], params["hop_size"], params["window"]
-        )
-        print(f"[hp_ca] float-WAV fallback decode ({data.dtype}, {exc})")
-        return {
-            "magnitudes": mags,
-            "frames": frames,
-            "bins": bins,
-            "sample_rate": int(sample_rate),
-            "stft": {
-                "fft": params["fft_size"], "hop": params["hop_size"],
-                "window": params["window"], "sample_rate": int(sample_rate),
-            },
-        }
+    import io
+    import numpy as np
+    from scipy.io import wavfile
+    from identdynamics import stft
+
+    params = client.stft_params(file_id=file_id)["canonical_stft"]
+    sample_rate, data = wavfile.read(io.BytesIO(client.file_wav(file_id)))
+    signal = data.astype(np.float64)
+    if np.issubdtype(data.dtype, np.integer):
+        signal /= float(np.iinfo(data.dtype).max)  # PCM -> [-1, 1]
+    if signal.ndim > 1:
+        signal = signal.mean(axis=1)  # mix to mono, matching the SDK
+    hop_size = (max(1, round(desired_delta_t * int(sample_rate)))
+                if desired_delta_t is not None else params["hop_size"])
+    mags, frames, bins = stft(
+        signal, params["fft_size"], hop_size, params["window"]
+    )
+    return {
+        "magnitudes": mags,
+        "frames": frames,
+        "bins": bins,
+        "sample_rate": int(sample_rate),
+        "stft": {
+            "fft": params["fft_size"], "hop": hop_size,
+            "window": params["window"], "sample_rate": int(sample_rate),
+        },
+    }
 
 
 def crop_fourier_band(fourier: dict, fmin: float, fmax: float) -> dict:
@@ -439,7 +452,8 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
               threshold: float = 0.45, dry_run: bool = False,
               render: bool = True, evolve_steps: int | None = None,
               bundle_root: str = BUNDLE_ROOT,
-              freq_band: tuple[float, float] = FREQ_BAND) -> RunOutcome:
+              freq_band: tuple[float, float] = FREQ_BAND,
+              desired_delta_t: float | None = 0.001) -> RunOutcome:
     """Execute one CA run over one ``hp`` stream file and save it to ident db.
 
     This is the top-level orchestrator: authenticate, resolve the stream, select
@@ -465,6 +479,10 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
             band before the CA runs (fewer bins -> faster), detections are tagged
             with it, and the render covers only the band. Defaults to
             :data:`FREQ_BAND`.
+        desired_delta_t: Target time resolution in seconds between spectrogram
+            frames.  Passed to :func:`fourier_for_saved_file`; defaults to
+            0.001 s (1 ms) for HP detector work.  Pass ``None`` for the SDK
+            default.
 
     Returns:
         A :class:`RunOutcome` describing the run and (unless ``dry_run``) the
@@ -495,9 +513,13 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
     print(f"[hp_ca] user={STREAM_USER} saved file id={file_id} name={name!r} "
           f"({chosen.get('wav_size_bytes', 0) / 1e6:.1f} MB)")
 
-    fourier = fourier_for_saved_file(client, file_id)
+    fourier = fourier_for_saved_file(client, file_id, desired_delta_t=desired_delta_t)
+    stft_info = fourier.get("stft", {})
+    actual_hop = stft_info.get("hop", 0)
+    actual_sr = stft_info.get("sample_rate", fourier.get("sample_rate", 0))
+    actual_dt = (actual_hop / actual_sr) if actual_sr else 0.0
     print(f"[hp_ca] fourier: {fourier['frames']} frames x {fourier['bins']} bins "
-          f"@ {fourier['sample_rate']} Hz")
+          f"@ {fourier['sample_rate']} Hz, hop={actual_hop} ({actual_dt*1000:.2f} ms/frame)")
 
     # Restrict the CA to the frequency band: the spectrogram is cropped to the
     # band's bins, so the CA evolves over far fewer cells (faster) and both the
@@ -588,6 +610,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=list(FREQ_BAND),
                    help="frequency band (Hz) to restrict the CA to "
                         "(default: %d %d)" % (int(FREQ_BAND[0]), int(FREQ_BAND[1])))
+    p.add_argument("--delta-t", type=float, default=0.001, dest="desired_delta_t",
+                   metavar="SECONDS",
+                   help="target time resolution between spectrogram frames in seconds; "
+                        "sets STFT hop = round(delta_t * sample_rate) "
+                        "(default: 0.001 s = 1 ms); pass 0 to use SDK default")
     return p.parse_args(argv)
 
 
@@ -614,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
             evolve_steps=args.evolve_steps,
             bundle_root=args.bundle_root,
             freq_band=(args.freq_band[0], args.freq_band[1]),
+            desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_ca] error: {type(exc).__name__}: {exc}")

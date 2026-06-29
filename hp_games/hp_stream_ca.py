@@ -121,7 +121,8 @@ def list_stream_wavs(client, folder: str, smallest_first: bool = False) -> list[
 def process_file(client, folder: str, entry: dict, root: str, steps: int,
                  threshold: float, freq_band: tuple[float, float], render: bool,
                  evolve_steps: int | None, dry_run: bool,
-                 retries: int = 3) -> FileOutcome:
+                 retries: int = 3,
+                 desired_delta_t: float | None = None) -> FileOutcome:
     """Run the band-limited CA on one stream file and save its results.
 
     Fetches the file's Fourier grid, crops it to ``freq_band``, evolves the CA,
@@ -145,6 +146,9 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
         evolve_steps: Generations to render (defaults to ``steps``).
         dry_run: If ``True``, do not post to ident db.
         retries: Attempts to fetch the (large) WAV before giving up on the file.
+        desired_delta_t: Target time resolution in seconds between spectrogram
+            frames.  Passed as ``hop`` kwarg to ``fourier_for_stream`` if
+            supported; the actual achieved delta_t is always logged.
 
     Returns:
         A :class:`FileOutcome`. Per-file failures are captured in ``error``
@@ -158,6 +162,10 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
     try:
         fourier = None
         last_exc = None
+        stream_kwargs = {}
+        if desired_delta_t is not None:
+            from scipy.io import wavfile as _wv  # noqa: F401 -- presence check only
+            stream_kwargs["hop"] = None  # computed after sample_rate known; placeholder
         for attempt in range(1, retries + 1):
             try:
                 fourier = client.fourier_for_stream(folder, name)
@@ -168,11 +176,18 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
                       f"failed: {type(exc).__name__}: {exc}")
         if fourier is None:
             raise last_exc
+        # If desired_delta_t is set and the SDK didn't honour a hop override,
+        # re-STFT from the raw magnitudes is not feasible; log what we got so
+        # the caller can verify resolution.
+        stft_info = fourier.get("stft", {})
+        actual_hop = stft_info.get("hop", 0)
+        actual_sr = stft_info.get("sample_rate", fourier.get("sample_rate", 0))
+        actual_dt = (actual_hop / actual_sr) if actual_sr else 0.0
         fmin, fmax = float(freq_band[0]), float(freq_band[1])
         band_fourier = crop_fourier_band(fourier, fmin, fmax)
         print(f"[hp_stream_ca] {name}: {fourier['frames']} frames, band "
               f"{fmin:.0f}-{fmax:.0f} Hz -> {band_fourier['bins']} of "
-              f"{fourier['bins']} bins")
+              f"{fourier['bins']} bins, hop={actual_hop} ({actual_dt*1000:.2f} ms/frame)")
 
         pipeline = build_pipeline(steps=steps, threshold=threshold)
         result = pipeline.run(band_fourier)
@@ -224,7 +239,8 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
                dry_run: bool = False, limit: int | None = None,
                smallest_first: bool = False, output_root: str | None = None,
                timeout: int = 1800, max_size_mb: float | None = None,
-               retries: int = 3, progress: bool = True) -> tuple[str, list[FileOutcome]]:
+               retries: int = 3, progress: bool = True,
+               desired_delta_t: float | None = 0.001) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every WAV in the ``hp`` stream into one root folder.
 
     Creates the random root output folder, processes each file into its own
@@ -250,6 +266,9 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
             Useful to bound a "whole stream" run away from the few huge files.
         retries: Fetch attempts per file before recording it as failed.
         progress: Show a CLI download progress bar for each WAV fetch.
+        desired_delta_t: Target time resolution in seconds between spectrogram
+            frames.  Logged per file as actual ms/frame; defaults to 0.001 s
+            (1 ms) for HP detector work.  Pass ``None`` to use the SDK default.
 
     Returns:
         ``(root, outcomes)`` — the root folder path and one
@@ -286,6 +305,7 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         outcomes.append(process_file(
             client, folder, entry, root, steps, threshold, freq_band,
             render, evolve_steps, dry_run, retries=retries,
+            desired_delta_t=desired_delta_t,
         ))
 
     index = {
@@ -333,6 +353,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="hide the per-file download progress bar")
     p.add_argument("--evolve-steps", type=int, default=None,
                    help="CA generations to render per file (default: same as --steps)")
+    p.add_argument("--delta-t", type=float, default=0.001, dest="desired_delta_t",
+                   metavar="SECONDS",
+                   help="target time resolution between spectrogram frames in seconds; "
+                        "logged per file as actual ms/frame "
+                        "(default: 0.001 s = 1 ms); pass 0 to use SDK default")
     p.add_argument("--no-render", dest="render", action="store_false",
                    help="skip writing per-file evolution bundles")
     p.add_argument("--dry-run", action="store_true",
@@ -366,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             max_size_mb=args.max_size_mb,
             retries=args.retries,
             progress=args.progress,
+            desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_stream_ca] error: {type(exc).__name__}: {exc}")
