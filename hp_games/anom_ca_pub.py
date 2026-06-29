@@ -44,12 +44,12 @@ from brahma_cellular import (
 
 _NAME = "hp_ca"
 _VERSION = "1.0.0"
-_DEFAULT_THRESHOLD = 0.45
-_DEFAULT_STEPS = 3
+_DEFAULT_THRESHOLD = 0.65
+_DEFAULT_STEPS = 4
 _DEFAULT_MIN_SIGMA = 1.5
-_DEFAULT_FMIN = 100_000.0   # Hz — lower edge of the target HP band
-_DEFAULT_FMAX = 150_000.0   # Hz — upper edge
-_DESIRED_DELTA_T = 0.001    # 1 ms target frame spacing (set hop = round(0.001 * sr))
+_DEFAULT_FMIN = 1000.0   # Hz — lower edge of the target HP band
+_DEFAULT_FMAX = 8000.0   # Hz — upper edge
+_DESIRED_DELTA_T = 0.01    # 1 ms target frame spacing (set hop = round(0.001 * sr))
 
 
 class AnomalyCADetector:
@@ -72,16 +72,10 @@ class AnomalyCADetector:
     version: str = _VERSION
     default_threshold: float = _DEFAULT_THRESHOLD
 
-    # Hints to the consumer's STFT setup.  sample_rate is omitted because HP
-    # detectors vary; the consumer should set hop = round(desired_delta_t * sr).
-    expects: dict = {
-        "window": "hann",
-        "desired_delta_t": _DESIRED_DELTA_T,
-    }
-
     def __init__(self, manifest: dict | None = None) -> None:
         self._fmin: float = _DEFAULT_FMIN
         self._fmax: float = _DEFAULT_FMAX
+        self._desired_delta_t: float = _DESIRED_DELTA_T
         self._steps: int = _DEFAULT_STEPS
         self._min_sigma: float = _DEFAULT_MIN_SIGMA
         self._threshold: float = _DEFAULT_THRESHOLD
@@ -91,11 +85,37 @@ class AnomalyCADetector:
         if params:
             self._apply(params)
 
+    @property
+    def expects(self) -> dict:
+        """STFT hints for the consumer, reflecting the current configuration.
+
+        ``desired_delta_t`` tells the consumer what hop to use:
+        ``hop = round(desired_delta_t * sample_rate)``.
+        ``fmin`` / ``fmax`` indicate the active band so the consumer can
+        optionally pre-crop the grid before calling :meth:`score`.
+        """
+        return {
+            "window": "hann",
+            "desired_delta_t": self._desired_delta_t,
+            "fmin": self._fmin,
+            "fmax": self._fmax,
+        }
+
     def configure(self, **params) -> None:
         """Late-bind runtime parameters.
 
         Called automatically by fetch_protected / configure_detector when the
         consumer passes params=…. Also callable directly to re-tune between files.
+
+        Accepted keys:
+            fmin (float): lower frequency band edge in Hz.
+            fmax (float): upper frequency band edge in Hz.
+            desired_delta_t (float): target frame spacing in seconds; the
+                consumer should set ``hop = round(desired_delta_t * sample_rate)``
+                when computing the Fourier grid.
+            steps (int): CA evolution steps.
+            min_sigma (float): anomaly z-score cutoff.
+            threshold (float): detection threshold in [0, 1].
         """
         self._apply(params)
 
@@ -104,6 +124,8 @@ class AnomalyCADetector:
             self._fmin = float(params["fmin"])
         if "fmax" in params:
             self._fmax = float(params["fmax"])
+        if "desired_delta_t" in params:
+            self._desired_delta_t = float(params["desired_delta_t"])
         if "steps" in params:
             self._steps = int(params["steps"])
         if "min_sigma" in params:
