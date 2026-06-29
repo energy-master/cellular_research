@@ -53,7 +53,7 @@ import time
 import uuid
 from dataclasses import dataclass, asdict
 
-from identdynamics import ApiError, list_local_audio_files, save_decisions_local
+from identdynamics import ApiError, list_local_audio_files
 from hp_ca import (
     BASE_URL,
     API_KEY,
@@ -64,6 +64,7 @@ from hp_ca import (
     crop_fourier_band,
     render_evolution,
     new_run_id,
+    write_decisions_sidecar,
 )
 
 #: Prefix for the random per-invocation root output folder (created inside the
@@ -393,36 +394,12 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
 
         # Decision sidecar (folder): one point-in-time record per detection,
         # written next to the audio so the app pairs it on folder-open.
-        # If a sidecar from a previous model already exists, merge its records
-        # with ours (keyed by signature) so multiple models accumulate rather
-        # than overwrite each other.
+        # write_decisions_sidecar merges with any existing sidecar so multiple
+        # models accumulate rather than overwrite each other.
         if save_folder and not dry_run and dets:
-            new_records = [{
-                "dt": float(d["start_sec"]),
-                "signature": model_name,
-                # The app counts a decision toward the thumbnail-lane bar only
-                # when decision == "detection" (folder-run.js); use that so the
-                # normalised per-file detection bars render like streams do.
-                "decision": "detection",
-                "reason": "ca band detection",
-                "frame": int(d.get("start", 0)),
-                "active_freq": band_label,
-            } for d in dets]
-            sidecar_path = os.path.join(
-                os.path.dirname(path),
-                os.path.splitext(name)[0] + ".decisions.json",
-            )
-            if os.path.exists(sidecar_path):
-                try:
-                    existing = json.load(open(sidecar_path, encoding="utf-8"))
-                    kept = [r for r in existing.get("decisions", [])
-                            if r.get("signature") != model_name]
-                    new_records = kept + new_records
-                except Exception:
-                    pass  # corrupt sidecar — overwrite cleanly
             try:
-                save_decisions_local(os.path.dirname(path),
-                                     [{"name": name, "decisions": new_records}])
+                write_decisions_sidecar(os.path.dirname(path), name,
+                                        model_name, band_label, dets)
                 n_sidecars += 1
             except OSError as exc:
                 print(f"[hp_local] {rel}: sidecar write failed: {exc}")

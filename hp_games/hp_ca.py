@@ -39,6 +39,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import uuid
 from dataclasses import dataclass
@@ -434,6 +435,52 @@ def render_evolution(fourier: dict, steps: int, out_dir: str,
     print(f"[hp_ca] CA evolution bundle: {out_dir} "
           f"({manifest['n_steps']} frames, video={manifest['video']})")
     return manifest
+
+
+def write_decisions_sidecar(audio_path: str, name: str, model_name: str,
+                            band_label: str, detections: list) -> None:
+    """Write (or merge into) a ``.decisions.json`` sidecar next to an audio file.
+
+    If a sidecar already exists, records from other model signatures are
+    preserved and only this model's records are replaced — so running
+    multiple models over the same audio accumulates all detections in one file
+    rather than each run clobbering the last.
+
+    Args:
+        audio_path: Directory that contains the audio file.
+        name: Audio file basename (e.g. ``"rec_001.wav"``).
+        model_name: Model signature; used as the ``signature`` field and as
+            the key for merging (existing records with this signature are
+            replaced, all others are kept).
+        band_label: Human-readable frequency band string written into each
+            record's ``active_freq`` field (e.g. ``"100000-150000 Hz"``).
+        detections: List of detection dicts with at least ``start_sec``,
+            ``end_sec``, and ``start`` keys (standard CA pipeline output).
+    """
+    from identdynamics import save_decisions_local
+
+    new_records = [{
+        "dt": float(d["start_sec"]),
+        "signature": model_name,
+        "decision": "detection",
+        "reason": "ca band detection",
+        "frame": int(d.get("start", 0)),
+        "active_freq": band_label,
+    } for d in detections]
+
+    sidecar_path = os.path.join(
+        audio_path, os.path.splitext(name)[0] + ".decisions.json"
+    )
+    if os.path.exists(sidecar_path):
+        try:
+            existing = json.load(open(sidecar_path, encoding="utf-8"))
+            kept = [r for r in existing.get("decisions", [])
+                    if r.get("signature") != model_name]
+            new_records = kept + new_records
+        except Exception:
+            pass  # corrupt sidecar — overwrite cleanly
+
+    save_decisions_local(audio_path, [{"name": name, "decisions": new_records}])
 
 
 def new_run_id(model_name: str | None = None) -> str:
