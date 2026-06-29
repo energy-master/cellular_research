@@ -460,8 +460,6 @@ def write_decisions_sidecar(audio_path: str, name: str, model_name: str,
             ``end_sec``, ``start``, ``fmin``, and ``fmax`` keys (standard CA
             pipeline output).
     """
-    from identdynamics import save_decisions_local
-
     fmin, fmax = float(freq_band[0]), float(freq_band[1])
     band_label = f"{int(fmin)}-{int(fmax)} Hz"
 
@@ -489,7 +487,13 @@ def write_decisions_sidecar(audio_path: str, name: str, model_name: str,
         except Exception:
             pass  # corrupt sidecar — overwrite cleanly
 
-    save_decisions_local(audio_path, [{"name": name, "decisions": new_records}])
+    # Write the JSON directly rather than via save_decisions_local, whose record
+    # sanitiser keeps only dt/time/signature/decision/reason/frame/active_freq —
+    # it would strip fmin_hz/fmax_hz/end_sec, the band the app needs to place the
+    # decision at its frequency.
+    with open(sidecar_path, "w", encoding="utf-8") as fh:
+        json.dump({"filename": name, "decisions": new_records}, fh,
+                  ensure_ascii=False, indent=2)
 
 
 def new_run_id(model_name: str | None = None) -> str:
