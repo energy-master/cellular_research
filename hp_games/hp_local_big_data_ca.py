@@ -352,7 +352,6 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     else:
         root = new_output_root()
     os.makedirs(root, exist_ok=True)
-    band_label = f"{int(freq_band[0])}-{int(freq_band[1])} Hz"
     print(f"[hp_local] folder={folder!r} files={len(files)} -> root={root!r} "
           f"(save_db={save_db}, save_folder={save_folder})")
 
