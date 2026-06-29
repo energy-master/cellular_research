@@ -341,8 +341,6 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     # each file on non-HFS volumes: they share the audio extension but are
     # metadata, not audio, and fail to decode.
     files = [p for p in files if not os.path.basename(p).startswith("._")]
-    if limit is not None:
-        files = files[:limit]
 
     # Default: create the random output root *inside* the acoustic-data folder
     # (so the CA-evolution bundles sit with the data). --output-root overrides it;
@@ -363,13 +361,14 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
     per_file: list[dict] = []
     first_stft: dict | None = None
     n_sidecars = 0
-    for i, path in enumerate(files, 1):
+    n_processed = 0  # files that passed the size cap (counts toward --limit)
+    for path in files:
         rel = os.path.relpath(path, folder)
         size_mb = os.path.getsize(path) / 1e6
-        print(f"[hp_local] ({i}/{len(files)}) {rel} ({size_mb:.0f} MB)")
         if cap_bytes is not None and os.path.getsize(path) > cap_bytes:
             # Decoding loads the whole WAV (+ float64 STFT) into RAM; cap the
             # on-disk size so a few multi-GB files can't OOM the whole run.
+            # Oversized files don't count toward --limit.
             stem = os.path.splitext(os.path.basename(path))[0]
             skipped = FileOutcome(file=os.path.basename(path), path=rel,
                                   out_dir=os.path.join(root, stem),
@@ -377,6 +376,10 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             print(f"[hp_local] {rel}: {skipped.error}")
             outcomes.append(skipped)
             continue
+        if limit is not None and n_processed >= limit:
+            break
+        n_processed += 1
+        print(f"[hp_local] ({n_processed}{f'/{limit}' if limit else ''}) {rel} ({size_mb:.0f} MB)")
         outcome, dets = process_file(
             path, folder, root, steps, threshold, freq_band, render, evolve_steps,
             desired_delta_t=desired_delta_t, model_name=model_name)
