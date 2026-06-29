@@ -42,7 +42,7 @@ from brahma_cellular import (
     GroupingRule,
 )
 
-_NAME = "hp_ca"
+_NAME = "brahma_ca_03252_anomaly"
 _VERSION = "1.0.0"
 _DEFAULT_THRESHOLD = 0.65
 _DEFAULT_STEPS = 4
