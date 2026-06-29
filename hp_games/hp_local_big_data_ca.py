@@ -121,8 +121,21 @@ def _stage(rel: str, msg: str, since: float | None = None) -> float:
     return now
 
 
+def _probe_sample_rate(path: str) -> int:
+    """Read sample rate from WAV header without loading audio data."""
+    import wave
+    try:
+        with wave.open(path) as wf:
+            return wf.getframerate()
+    except Exception:
+        from scipy.io import wavfile
+        rate, _ = wavfile.read(path)
+        return int(rate)
+
+
 def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
-                      window: str = "hann") -> dict:
+                      window: str = "hann",
+                      desired_delta_t: float | None = None) -> dict:
     """Fourier grid for a local WAV, tolerant of IEEE-float files.
 
     Uses the SDK's reference STFT (``fourier_for_path``) and, on a decode failure
@@ -135,11 +148,19 @@ def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
         fft: FFT size.
         hop: Hop size (defaults to ``fft // 4``).
         window: Window name.
+        desired_delta_t: Target time resolution in seconds between spectrogram
+            frames.  If given (and ``hop`` is ``None``), the sample rate is
+            probed from the WAV header and ``hop`` is set to
+            ``round(desired_delta_t * sample_rate)``.
 
     Returns:
         The standard Fourier dict (``magnitudes``/``frames``/``bins``/``stft``).
     """
     from identdynamics import fourier_for_path
+
+    if desired_delta_t is not None and hop is None:
+        sr = _probe_sample_rate(path)
+        hop = max(1, round(desired_delta_t * sr))
 
     try:
         return fourier_for_path(path, fft=fft, hop=hop, window=window)
@@ -154,6 +175,8 @@ def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
             signal /= float(np.iinfo(data.dtype).max)
         if signal.ndim > 1:
             signal = signal.mean(axis=1)
+        if hop is None and desired_delta_t is not None:
+            hop = max(1, round(desired_delta_t * int(sample_rate)))
         hop_size = (fft >> 2) if hop is None else int(hop)
         mags, frames, bins = stft(signal, fft, hop_size, window)
         return {
@@ -166,7 +189,8 @@ def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
 
 def process_file(path: str, folder: str, root: str, steps: int, threshold: float,
                  freq_band: tuple[float, float], render: bool,
-                 evolve_steps: int | None) -> tuple[FileOutcome, list | None]:
+                 evolve_steps: int | None,
+                 desired_delta_t: float | None = None) -> tuple[FileOutcome, list | None]:
     """Run the band-limited CA on one local file; render + collect detections.
 
     Args:
@@ -178,6 +202,9 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
         freq_band: ``(fmin, fmax)`` Hz band the CA is restricted to.
         render: Whether to write the evolution bundle.
         evolve_steps: Generations to render (defaults to ``steps``).
+        desired_delta_t: Target time resolution (seconds) between spectrogram
+            frames.  Passed to :func:`fourier_for_local`; the actual hop is
+            logged after decoding.
 
     Returns:
         ``(outcome, detections)`` where ``detections`` is the raw list of
@@ -197,10 +224,15 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
 
     try:
         t = _stage(rel, f"decoding + STFT ({size_mb:.0f} MB)")
-        fourier = fourier_for_local(path)
+        fourier = fourier_for_local(path, desired_delta_t=desired_delta_t)
         band_fourier = crop_fourier_band(fourier, fmin, fmax)
+        stft_info = fourier.get("stft", {})
+        actual_hop = stft_info.get("hop", 0)
+        actual_sr = stft_info.get("sample_rate", fourier.get("sample_rate", 0))
+        actual_dt = (actual_hop / actual_sr) if actual_sr else 0.0
         t = _stage(rel, f"{fourier['frames']} frames x {fourier['bins']} bins "
-                        f"-> band {fmin:.0f}-{fmax:.0f} Hz ({band_fourier['bins']} bins)",
+                        f"-> band {fmin:.0f}-{fmax:.0f} Hz ({band_fourier['bins']} bins), "
+                        f"hop={actual_hop} ({actual_dt*1000:.2f} ms/frame)",
                    since=t)
 
         pipeline = build_pipeline(steps=steps, threshold=threshold)
@@ -247,7 +279,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               project_name: str | None = None,
               save_db: bool = True, save_folder: bool = True,
               max_size_mb: float | None = None,
-              output_in_folder: bool = False) -> tuple[str, list[FileOutcome]]:
+              output_in_folder: bool = False,
+              desired_delta_t: float | None = 0.001) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
@@ -281,6 +314,10 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         save_folder: Write a decision sidecar next to each audio file.
         max_size_mb: Skip files larger than this many MB (``None`` = no cap).
             Decoding loads the whole WAV into RAM, so this bounds peak memory.
+        desired_delta_t: Target time resolution (seconds) between spectrogram
+            frames — sets the STFT hop to ``round(desired_delta_t * sample_rate)``.
+            Defaults to 0.001 s (1 ms) for HP detector work.  Pass ``None`` to
+            use the SDK default (``fft // 4``).
 
     Returns:
         ``(root, outcomes)`` -- the root output folder and one
@@ -334,7 +371,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             outcomes.append(skipped)
             continue
         outcome, dets = process_file(
-            path, folder, root, steps, threshold, freq_band, render, evolve_steps)
+            path, folder, root, steps, threshold, freq_band, render, evolve_steps,
+            desired_delta_t=desired_delta_t)
         outcomes.append(outcome)
         gc.collect()  # release the file's decoded signal/grid before the next
         if dets is None:
@@ -439,6 +477,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Work Project name (default: folder basename)")
     p.add_argument("--evolve-steps", type=int, default=None,
                    help="CA generations to render per file (default: same as --steps)")
+    p.add_argument("--delta-t", type=float, default=0.001, dest="desired_delta_t",
+                   metavar="SECONDS",
+                   help="target time resolution between spectrogram frames in seconds; "
+                        "sets STFT hop = round(delta_t * sample_rate) "
+                        "(default: 0.001 s = 1 ms); pass 0 to use SDK default fft//4")
     p.add_argument("--no-render", dest="render", action="store_false",
                    help="skip writing per-file evolution bundles")
     p.add_argument("--no-save-db", dest="save_db", action="store_false",
@@ -469,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
             save_folder=args.save_folder,
             max_size_mb=args.max_size_mb,
             output_in_folder=args.output_in_folder,
+            desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
         )
     except (ApiError, NotADirectoryError, ValueError) as exc:
         print(f"[hp_local] error: {type(exc).__name__}: {exc}")
