@@ -196,9 +196,13 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
         result.pop("_ca", None)
         scores = result["scores"]
         detections = result["detections"]
+        band_label = f"{int(fmin)}-{int(fmax)} Hz"
         for det in detections:
             det["fmin"] = fmin
             det["fmax"] = fmax
+            det["fmin_hz"] = float(det.get("fmin", fmin))
+            det["fmax_hz"] = float(det.get("fmax", fmax))
+            det["active_freq"] = band_label
 
         run_id = new_run_id(model_name)
         outcome.run_id = run_id
