@@ -17,9 +17,6 @@ CLAUDE.local.md
 .vscode/
 .DS_Store
 
-# --- Protected model source (never commit obfuscation targets) ---
-hp_games/anom_ca_pub.py
-
 # --- Secrets / credentials ---
 .env
 .env.*
