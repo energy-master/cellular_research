@@ -121,8 +121,8 @@ def list_stream_wavs(client, folder: str, smallest_first: bool = False) -> list[
 def process_file(client, folder: str, entry: dict, root: str, steps: int,
                  threshold: float, freq_band: tuple[float, float], render: bool,
                  evolve_steps: int | None, dry_run: bool,
-                 retries: int = 3,
-                 desired_delta_t: float | None = None) -> FileOutcome:
+                 retries: int = 3, desired_delta_t: float | None = None,
+                 model_name: str = MODEL_NAME) -> FileOutcome:
     """Run the band-limited CA on one stream file and save its results.
 
     Fetches the file's Fourier grid, crops it to ``freq_band``, evolves the CA,
@@ -149,6 +149,8 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
         desired_delta_t: Target time resolution in seconds between spectrogram
             frames.  Passed as ``hop`` kwarg to ``fourier_for_stream`` if
             supported; the actual achieved delta_t is always logged.
+        model_name: Model label recorded against the run and used as run-id
+            prefix.  Defaults to :data:`MODEL_NAME`.
 
     Returns:
         A :class:`FileOutcome`. Per-file failures are captured in ``error``
@@ -198,7 +200,7 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
             det["fmin"] = fmin
             det["fmax"] = fmax
 
-        run_id = new_run_id()
+        run_id = new_run_id(model_name)
         outcome.run_id = run_id
         outcome.n_frames = len(scores)
         outcome.n_detections = len(detections)
@@ -216,7 +218,7 @@ def process_file(client, folder: str, entry: dict, root: str, steps: int,
         if not dry_run:
             client.post_run(
                 target={"kind": "stream", "folder": folder, "file": name},
-                model_name=result["model_name"],
+                model_name=model_name,
                 scores=scores,
                 threshold=result["threshold"],
                 stft=result.get("stft", {}),
@@ -240,7 +242,8 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
                smallest_first: bool = False, output_root: str | None = None,
                timeout: int = 1800, max_size_mb: float | None = None,
                retries: int = 3, progress: bool = True,
-               desired_delta_t: float | None = 0.001) -> tuple[str, list[FileOutcome]]:
+               desired_delta_t: float | None = 0.001,
+               model_name: str = MODEL_NAME) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every WAV in the ``hp`` stream into one root folder.
 
     Creates the random root output folder, processes each file into its own
@@ -269,6 +272,8 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         desired_delta_t: Target time resolution in seconds between spectrogram
             frames.  Logged per file as actual ms/frame; defaults to 0.001 s
             (1 ms) for HP detector work.  Pass ``None`` to use the SDK default.
+        model_name: Model label recorded against each run and used as run-id
+            prefix.  Defaults to :data:`MODEL_NAME` (``"hp_ca"``).
 
     Returns:
         ``(root, outcomes)`` — the root folder path and one
@@ -305,12 +310,12 @@ def run_stream(base_url: str = BASE_URL, token: str = API_KEY,
         outcomes.append(process_file(
             client, folder, entry, root, steps, threshold, freq_band,
             render, evolve_steps, dry_run, retries=retries,
-            desired_delta_t=desired_delta_t,
+            desired_delta_t=desired_delta_t, model_name=model_name,
         ))
 
     index = {
         "stream": folder,
-        "model_name": MODEL_NAME,
+        "model_name": model_name,
         "band_hz": [float(freq_band[0]), float(freq_band[1])],
         "n_files": len(outcomes),
         "n_posted": sum(1 for o in outcomes if o.posted),
@@ -358,6 +363,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="target time resolution between spectrogram frames in seconds; "
                         "logged per file as actual ms/frame "
                         "(default: 0.001 s = 1 ms); pass 0 to use SDK default")
+    p.add_argument("--model-name", default=MODEL_NAME, dest="model_name",
+                   help="model label recorded against each run and used as the "
+                        "run-id prefix (default: %s)" % MODEL_NAME)
     p.add_argument("--no-render", dest="render", action="store_false",
                    help="skip writing per-file evolution bundles")
     p.add_argument("--dry-run", action="store_true",
@@ -392,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             retries=args.retries,
             progress=args.progress,
             desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
+            model_name=args.model_name,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_stream_ca] error: {type(exc).__name__}: {exc}")

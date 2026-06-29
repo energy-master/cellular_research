@@ -436,14 +436,16 @@ def render_evolution(fourier: dict, steps: int, out_dir: str,
     return manifest
 
 
-def new_run_id() -> str:
+def new_run_id(model_name: str | None = None) -> str:
     """Mint a random run id for an ``hp_ca`` run.
 
+    Args:
+        model_name: Prefix label; defaults to :data:`MODEL_NAME`.
+
     Returns:
-        A unique id of the form ``"hp_ca-<uuid4-hex>"``, suitable as a distinct
-        ident db run row.
+        A unique id of the form ``"<model_name>-<uuid4-hex>"``.
     """
-    return f"{MODEL_NAME}-{uuid.uuid4().hex}"
+    return f"{model_name or MODEL_NAME}-{uuid.uuid4().hex}"
 
 
 def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
@@ -453,7 +455,8 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
               render: bool = True, evolve_steps: int | None = None,
               bundle_root: str = BUNDLE_ROOT,
               freq_band: tuple[float, float] = FREQ_BAND,
-              desired_delta_t: float | None = 0.001) -> RunOutcome:
+              desired_delta_t: float | None = 0.001,
+              model_name: str = MODEL_NAME) -> RunOutcome:
     """Execute one CA run over one ``hp`` stream file and save it to ident db.
 
     This is the top-level orchestrator: authenticate, resolve the stream, select
@@ -483,6 +486,8 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
             frames.  Passed to :func:`fourier_for_saved_file`; defaults to
             0.001 s (1 ms) for HP detector work.  Pass ``None`` for the SDK
             default.
+        model_name: Model label recorded against the run and used as the
+            run-id prefix.  Defaults to :data:`MODEL_NAME` (``"hp_ca"``).
 
     Returns:
         A :class:`RunOutcome` describing the run and (unless ``dry_run``) the
@@ -542,7 +547,7 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
         det["fmin"] = fmin
         det["fmax"] = fmax
 
-    run_id = new_run_id()
+    run_id = new_run_id(model_name)
     print(f"[hp_ca] CA run: {len(scores)} frames, {len(detections)} detections, "
           f"band={fmin:.0f}-{fmax:.0f} Hz, run_id={run_id}")
 
@@ -550,7 +555,7 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
         run_id=run_id,
         stream=folder,
         file=name,
-        model_name=MODEL_NAME,
+        model_name=model_name,
         n_frames=len(scores),
         n_detections=len(detections),
         threshold=threshold,
@@ -576,7 +581,7 @@ def run_hp_ca(base_url: str = BASE_URL, token: str = API_KEY,
     target = {"kind": "file", "id": file_id}
     response = client.post_run(
         target=target,
-        model_name=result["model_name"],
+        model_name=model_name,
         scores=scores,
         threshold=result["threshold"],
         stft=result.get("stft", {}),
@@ -615,6 +620,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="target time resolution between spectrogram frames in seconds; "
                         "sets STFT hop = round(delta_t * sample_rate) "
                         "(default: 0.001 s = 1 ms); pass 0 to use SDK default")
+    p.add_argument("--model-name", default=MODEL_NAME, dest="model_name",
+                   help="model label recorded against the run and used as the "
+                        "run-id prefix (default: %s)" % MODEL_NAME)
     return p.parse_args(argv)
 
 
@@ -642,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             bundle_root=args.bundle_root,
             freq_band=(args.freq_band[0], args.freq_band[1]),
             desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
+            model_name=args.model_name,
         )
     except (ApiError, LookupError, ValueError) as exc:
         print(f"[hp_ca] error: {type(exc).__name__}: {exc}")

@@ -189,8 +189,8 @@ def fourier_for_local(path: str, fft: int = 1024, hop: int | None = None,
 
 def process_file(path: str, folder: str, root: str, steps: int, threshold: float,
                  freq_band: tuple[float, float], render: bool,
-                 evolve_steps: int | None,
-                 desired_delta_t: float | None = None) -> tuple[FileOutcome, list | None]:
+                 evolve_steps: int | None, desired_delta_t: float | None = None,
+                 model_name: str = MODEL_NAME) -> tuple[FileOutcome, list | None]:
     """Run the band-limited CA on one local file; render + collect detections.
 
     Args:
@@ -205,6 +205,8 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
         desired_delta_t: Target time resolution (seconds) between spectrogram
             frames.  Passed to :func:`fourier_for_local`; the actual hop is
             logged after decoding.
+        model_name: Model label used as the run-id prefix and written into
+            decision sidecars as the ``signature`` field.
 
     Returns:
         ``(outcome, detections)`` where ``detections`` is the raw list of
@@ -244,7 +246,7 @@ def process_file(path: str, folder: str, root: str, steps: int, threshold: float
             det["fmin"] = fmin
             det["fmax"] = fmax
 
-        run_id = new_run_id()
+        run_id = new_run_id(model_name)
         outcome.run_id = run_id
         outcome.n_frames = len(result["scores"])
         outcome.n_detections = len(detections)
@@ -280,7 +282,8 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
               save_db: bool = True, save_folder: bool = True,
               max_size_mb: float | None = None,
               output_in_folder: bool = False,
-              desired_delta_t: float | None = 0.001) -> tuple[str, list[FileOutcome]]:
+              desired_delta_t: float | None = 0.001,
+              model_name: str = MODEL_NAME) -> tuple[str, list[FileOutcome]]:
     """Run the CA over every audio file in a local folder; save db + folder.
 
     Renders a per-file evolution bundle for each file under a random root folder,
@@ -318,6 +321,9 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             frames — sets the STFT hop to ``round(desired_delta_t * sample_rate)``.
             Defaults to 0.001 s (1 ms) for HP detector work.  Pass ``None`` to
             use the SDK default (``fft // 4``).
+        model_name: Model label recorded in ident db and written as the
+            ``signature`` in each decision sidecar.  Defaults to
+            :data:`MODEL_NAME` (``"hp_ca"``).
 
     Returns:
         ``(root, outcomes)`` -- the root output folder and one
@@ -372,7 +378,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
             continue
         outcome, dets = process_file(
             path, folder, root, steps, threshold, freq_band, render, evolve_steps,
-            desired_delta_t=desired_delta_t)
+            desired_delta_t=desired_delta_t, model_name=model_name)
         outcomes.append(outcome)
         gc.collect()  # release the file's decoded signal/grid before the next
         if dets is None:
@@ -387,10 +393,13 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
 
         # Decision sidecar (folder): one point-in-time record per detection,
         # written next to the audio so the app pairs it on folder-open.
+        # If a sidecar from a previous model already exists, merge its records
+        # with ours (keyed by signature) so multiple models accumulate rather
+        # than overwrite each other.
         if save_folder and not dry_run and dets:
-            records = [{
+            new_records = [{
                 "dt": float(d["start_sec"]),
-                "signature": MODEL_NAME,
+                "signature": model_name,
                 # The app counts a decision toward the thumbnail-lane bar only
                 # when decision == "detection" (folder-run.js); use that so the
                 # normalised per-file detection bars render like streams do.
@@ -399,9 +408,21 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
                 "frame": int(d.get("start", 0)),
                 "active_freq": band_label,
             } for d in dets]
+            sidecar_path = os.path.join(
+                os.path.dirname(path),
+                os.path.splitext(name)[0] + ".decisions.json",
+            )
+            if os.path.exists(sidecar_path):
+                try:
+                    existing = json.load(open(sidecar_path, encoding="utf-8"))
+                    kept = [r for r in existing.get("decisions", [])
+                            if r.get("signature") != model_name]
+                    new_records = kept + new_records
+                except Exception:
+                    pass  # corrupt sidecar — overwrite cleanly
             try:
                 save_decisions_local(os.path.dirname(path),
-                                     [{"name": name, "decisions": records}])
+                                     [{"name": name, "decisions": new_records}])
                 n_sidecars += 1
             except OSError as exc:
                 print(f"[hp_local] {rel}: sidecar write failed: {exc}")
@@ -421,7 +442,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
         project = client.save_run_project(
             folder=folder,
             per_file=per_file,
-            model_name=MODEL_NAME,
+            model_name=model_name,
             name=project_name,
             stft=first_stft,
         )
@@ -434,7 +455,7 @@ def run_local(folder: str, base_url: str = BASE_URL, token: str = API_KEY,
 
     index = {
         "folder": folder,
-        "model_name": MODEL_NAME,
+        "model_name": model_name,
         "band_hz": [float(freq_band[0]), float(freq_band[1])],
         "n_files": len(outcomes),
         "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
@@ -482,6 +503,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="target time resolution between spectrogram frames in seconds; "
                         "sets STFT hop = round(delta_t * sample_rate) "
                         "(default: 0.001 s = 1 ms); pass 0 to use SDK default fft//4")
+    p.add_argument("--model-name", default=MODEL_NAME, dest="model_name",
+                   help="model label recorded in ident db and written as the signature "
+                        "in decision sidecars (default: %s)" % MODEL_NAME)
     p.add_argument("--no-render", dest="render", action="store_false",
                    help="skip writing per-file evolution bundles")
     p.add_argument("--no-save-db", dest="save_db", action="store_false",
@@ -513,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
             max_size_mb=args.max_size_mb,
             output_in_folder=args.output_in_folder,
             desired_delta_t=args.desired_delta_t if args.desired_delta_t else None,
+            model_name=args.model_name,
         )
     except (ApiError, NotADirectoryError, ValueError) as exc:
         print(f"[hp_local] error: {type(exc).__name__}: {exc}")
