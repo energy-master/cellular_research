@@ -33,11 +33,11 @@ from identdynamics import (
     ApiError,
     fetch_protected,
     list_local_audio_files,
-    score_fourier,
 )
 from hp_ca import (
     BASE_URL,
     API_KEY,
+    build_pipeline,
     crop_fourier_band,
     make_client,
     new_run_id,
@@ -91,48 +91,6 @@ def _stage(rel: str, msg: str, since: float | None = None) -> float:
     return now
 
 
-def _scores_to_detections(scores, threshold: float, hop: int,
-                           sample_rate: float, fmin: float,
-                           fmax: float) -> list[dict]:
-    """Threshold a per-frame score curve into detection interval dicts.
-
-    Consecutive frames at or above ``threshold`` are merged into one
-    detection.  Each dict matches the standard CA pipeline detection shape
-    (``start`` / ``start_sec`` / ``end_sec`` / ``fmin`` / ``fmax``) so
-    :func:`write_decisions_sidecar` can consume it directly.
-    """
-    import numpy as np
-
-    scores = np.asarray(scores, dtype=np.float32)
-    dt = hop / sample_rate
-    detections: list[dict] = []
-    in_det = False
-    start_frame = 0
-
-    for i, s in enumerate(scores):
-        if s >= threshold and not in_det:
-            in_det = True
-            start_frame = i
-        elif s < threshold and in_det:
-            in_det = False
-            detections.append({
-                "start": start_frame,
-                "start_sec": float(start_frame * dt),
-                "end_sec": float(i * dt),
-                "score": float(scores[start_frame:i].max()),
-                "fmin": fmin,
-                "fmax": fmax,
-            })
-    if in_det:
-        detections.append({
-            "start": start_frame,
-            "start_sec": float(start_frame * dt),
-            "end_sec": float(len(scores) * dt),
-            "score": float(scores[start_frame:].max()),
-            "fmin": fmin,
-            "fmax": fmax,
-        })
-    return detections
 
 
 # ---------------------------------------------------------------------------
@@ -180,20 +138,24 @@ def process_file(path: str, folder: str, root: str, det,
         t = _stage(rel, f"{fourier['frames']} frames x {fourier['bins']} bins, "
                         f"hop={actual_hop} ({actual_dt * 1000:.2f} ms/frame)", since=t)
 
-        t = _stage(rel, "scoring (protected model)")
-        scores = score_fourier(det, fourier)
-        detections = _scores_to_detections(
-            scores, threshold, actual_hop, actual_sr, fmin, fmax)
+        t = _stage(rel, f"cropping band + running CA ({steps} steps)")
+        band_fourier = crop_fourier_band(fourier, fmin, fmax)
+        pipeline = build_pipeline(steps=steps, threshold=threshold)
+        result = pipeline.run(band_fourier)
+        result.pop("_ca", None)
+        detections = result["detections"]
+        for d in detections:
+            d["fmin"] = fmin
+            d["fmax"] = fmax
 
         run_id = new_run_id(PROTECTED_MODEL)
         outcome.run_id = run_id
-        outcome.n_frames = len(scores)
+        outcome.n_frames = len(result["scores"])
         outcome.n_detections = len(detections)
         t = _stage(rel, f"{outcome.n_detections} detections", since=t)
 
         if render:
             t = _stage(rel, "rendering CA evolution")
-            band_fourier = crop_fourier_band(fourier, fmin, fmax)
             render_evolution(
                 band_fourier,
                 evolve_steps if evolve_steps is not None else steps,
