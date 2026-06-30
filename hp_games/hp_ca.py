@@ -374,7 +374,7 @@ def build_rule(steps: int = 3):
     )
 
 
-def build_pipeline(steps: int = 3, threshold: float = 0.45) -> Pipeline:
+def build_pipeline(steps: int = 3, threshold: float = 0.65) -> Pipeline:
     """Build the CA pipeline for the ``hp_ca`` model.
 
     Args:
