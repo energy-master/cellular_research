@@ -97,7 +97,7 @@ def _stage(rel: str, msg: str, since: float | None = None) -> float:
 # Per-file processing
 # ---------------------------------------------------------------------------
 
-def process_file(path: str, folder: str, root: str, det,
+def process_file(path: str, folder: str, root: str, _det,
                  fmin: float, fmax: float, desired_delta_t: float,
                  threshold: float, steps: int,
                  render: bool, evolve_steps: int | None,
