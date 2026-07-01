@@ -121,6 +121,12 @@ merge-safe: existing records from other models (e.g. `hp_ca`,
 `brahma_ca_03252_anomaly`) are preserved; only records with matching
 `signature == "anom_bio_0023"` are replaced on a re-run.
 
+**Score sidecars** (`<stem>.scores.json`) are also written next to each
+audio file — the per-frame `[0, 1]` score curve plus the STFT params
+and band, so the webapp's "score vs time" plot renders exactly like a
+server-side run. Score sidecars are written even when detections are
+zero, so you can visually confirm the model was reactive at all.
+
 ## Detection Record Shape
 
 Each entry in `<stem>.decisions.json` looks like:

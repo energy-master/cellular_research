@@ -50,7 +50,12 @@ from brahma_cellular import (
     LocalOutlierRule,
     SpectralFluxRule,
 )
-from identdynamics import ApiError, fourier_for_path, list_local_audio_files
+from identdynamics import (
+    ApiError,
+    fourier_for_path,
+    list_local_audio_files,
+    save_scores_local,
+)
 from hp_ca import (
     crop_fourier_band,
     new_run_id,
@@ -179,11 +184,13 @@ def process_file(path: str, folder: str, root: str,
                  threshold: float, steps: int, min_sigma: float,
                  rule_name: str,
                  render: bool, evolve_steps: int | None,
-                 ) -> tuple[FileOutcome, list | None]:
+                 ) -> tuple[FileOutcome, list | None, dict | None]:
     """Run the ms-echo CA on one file; render its CA evolution.
 
     Returns:
-        ``(outcome, detections)`` — detections is ``None`` on error.
+        ``(outcome, detections, extras)`` — ``detections`` and ``extras`` are
+        ``None`` on error. ``extras`` carries the raw per-frame ``scores`` and
+        the ``stft`` params needed by :func:`identdynamics.save_scores_local`.
     """
     name = os.path.basename(path)
     rel = os.path.relpath(path, folder)
@@ -242,11 +249,12 @@ def process_file(path: str, folder: str, root: str,
 
         print(f"[anom_bio] {rel}: {outcome.n_detections} detections, "
               f"run_id={run_id}", flush=True)
-        return outcome, detections
+        extras = {"scores": result["scores"], "stft": stft_info}
+        return outcome, detections, extras
     except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
         outcome.error = f"{type(exc).__name__}: {exc}"
         print(f"[anom_bio] {rel}: ERROR {outcome.error}")
-        return outcome, None
+        return outcome, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +302,7 @@ def run_bio(target: str,
 
     outcomes: list[FileOutcome] = []
     n_sidecars = 0
+    n_score_sidecars = 0
     n_processed = 0
 
     for path in files:
@@ -316,26 +325,43 @@ def run_bio(target: str,
         print(f"[anom_bio] ({n_processed}{f'/{limit}' if limit else ''}) "
               f"{rel} ({size_mb:.0f} MB)")
 
-        outcome, dets = process_file(
+        outcome, dets, extras = process_file(
             path, folder, root,
             fmin, fmax, desired_delta_t, threshold, steps, min_sigma,
             rule_name, render, evolve_steps)
         outcomes.append(outcome)
         gc.collect()
 
-        if dets and not dry_run:
+        if not dry_run and dets:
             try:
                 write_decisions_sidecar(
                     os.path.dirname(path), os.path.basename(path),
                     MODEL_NAME, (fmin, fmax), dets)
                 n_sidecars += 1
             except OSError as exc:
-                print(f"[anom_bio] {rel}: sidecar write failed: {exc}")
+                print(f"[anom_bio] {rel}: decision sidecar write failed: {exc}")
+
+        # Score-vs-time sidecar for the app's "score vs time" plot. Written even
+        # when there are zero detections so the curve is still viewable.
+        if not dry_run and extras is not None:
+            try:
+                save_scores_local(os.path.dirname(path), [{
+                    "name": os.path.basename(path),
+                    "scores": extras["scores"],
+                    "threshold": threshold,
+                    "stft": extras["stft"],
+                    "fmin": fmin, "fmax": fmax,
+                    "model_name": MODEL_NAME,
+                }])
+                n_score_sidecars += 1
+            except OSError as exc:
+                print(f"[anom_bio] {rel}: score sidecar write failed: {exc}")
 
     if dry_run:
         print(f"[anom_bio] dry-run: sidecars skipped")
     else:
-        print(f"[anom_bio] wrote {n_sidecars} decision sidecar(s) into {folder}")
+        print(f"[anom_bio] wrote {n_sidecars} decision sidecar(s) and "
+              f"{n_score_sidecars} score sidecar(s) into {folder}")
 
     index = {
         "folder": folder,
@@ -350,6 +376,7 @@ def run_bio(target: str,
         "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
         "n_failed": sum(1 for o in outcomes if o.error and not o.error.startswith("skipped:")),
         "n_sidecars": n_sidecars,
+        "n_score_sidecars": n_score_sidecars,
         "files": [asdict(o) for o in outcomes],
     }
     with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as fh:
