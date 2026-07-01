@@ -47,7 +47,7 @@ from hp_ca import (
 from hp_local_big_data_ca import fourier_for_local
 
 #: Protected model name registered in ident db.
-PROTECTED_MODEL = "brahma_ca_03252_anomaly"
+PROTECTED_MODEL = "brahma_ca_03252_anomaly_v1.01_l"
 
 #: Prefix for the random per-invocation output folder.
 OUTPUT_PREFIX = "anom_hunter_out"
@@ -55,8 +55,8 @@ OUTPUT_PREFIX = "anom_hunter_out"
 _DEFAULT_FMIN = 1000.0
 _DEFAULT_FMAX = 8000.0
 _DEFAULT_DELTA_T = 0.01
-_DEFAULT_THRESHOLD = 0.65
-_DEFAULT_STEPS = 4
+_DEFAULT_THRESHOLD = 0.45
+_DEFAULT_STEPS = 3
 
 
 # ---------------------------------------------------------------------------

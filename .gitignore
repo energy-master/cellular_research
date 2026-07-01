@@ -38,6 +38,12 @@ data/
 renders/
 stream_hp_out*/
 local_ca_out*/
+outputdata*/
+anom_hunter_out*/
 *.png
 *.mp4
 *.gif
+
+# --- PyArmor build artefacts ---
+pyarmor.bug.log
+hp_games/dist/
