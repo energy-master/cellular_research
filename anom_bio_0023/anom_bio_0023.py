@@ -76,6 +76,7 @@ _DEFAULT_THRESHOLD = 0.3
 _DEFAULT_STEPS = 1
 _DEFAULT_MIN_SIGMA = 1.5
 _DEFAULT_RULE = "flux_anomaly"
+_DEFAULT_MAX_SIZE_MB = 550.0
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +295,8 @@ def run_bio(target: str,
             min_sigma: float = _DEFAULT_MIN_SIGMA,
             rule_name: str = _DEFAULT_RULE,
             render: bool = True, evolve_steps: int | None = None,
-            limit: int | None = None, max_size_mb: float | None = None,
+            limit: int | None = None,
+            max_size_mb: float | None = _DEFAULT_MAX_SIZE_MB,
             output_root: str | None = None,
             dry_run: bool = False) -> tuple[str, list[FileOutcome]]:
     """Score the ms-echo CA over a single WAV or every WAV in a folder.
@@ -457,8 +459,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CA generations to render (default: same as --steps)")
     p.add_argument("--limit", type=int, default=None,
                    help="process at most N files under the size cap (default: all)")
-    p.add_argument("--max-size-mb", type=float, default=None,
-                   help="skip files larger than this many MB (default: no cap)")
+    p.add_argument("--max-size-mb", type=float, default=_DEFAULT_MAX_SIZE_MB,
+                   help=f"skip files larger than this many MB "
+                        f"(default: {_DEFAULT_MAX_SIZE_MB:.0f}; pass 0 to disable)")
     p.add_argument("--output-root", default=None,
                    help=f"explicit output folder (default: random {OUTPUT_PREFIX}<rand>)")
     p.add_argument("--no-render", dest="render", action="store_false",
@@ -484,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             evolve_steps=args.evolve_steps,
             render=args.render,
             limit=args.limit,
-            max_size_mb=args.max_size_mb,
+            max_size_mb=(args.max_size_mb if args.max_size_mb else None),
             output_root=args.output_root,
             dry_run=args.dry_run,
         )

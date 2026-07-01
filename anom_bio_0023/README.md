@@ -76,7 +76,7 @@ python anom_bio_0023.py /data/hydrophone --no-render
 | `--rule` | `flux_anomaly` | CA rule chain preset — see below |
 | `--evolve-steps N` | *(same as --steps)* | CA generations to render (visualization only) |
 | `--limit N` | *(all)* | Process at most N files that pass the size cap (folder mode) |
-| `--max-size-mb MB` | *(no cap)* | Skip files larger than this (folder mode) |
+| `--max-size-mb MB` | `550` | Skip files larger than this (folder mode); pass `0` to disable the cap |
 | `--output-root PATH` | *(random)* | Explicit output folder for render bundles; defaults to `anom_bio_out<rand>` |
 | `--no-render` | — | Skip CA evolution render bundles (decisions only) |
 | `--dry-run` | — | Score and render but do not write decision sidecars |
