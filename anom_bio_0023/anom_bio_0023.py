@@ -45,7 +45,10 @@ from brahma_cellular import (
     Pipeline,
     WolframRule,
     AnomalyDetectionRule,
+    EdgeGatedAnomalyRule,
     GroupingRule,
+    LocalOutlierRule,
+    SpectralFluxRule,
 )
 from identdynamics import ApiError, fourier_for_path, list_local_audio_files
 from hp_ca import (
@@ -64,9 +67,10 @@ OUTPUT_PREFIX = "anom_bio_out"
 _DEFAULT_FMIN = 100_000.0
 _DEFAULT_FMAX = 140_000.0
 _DEFAULT_DELTA_T = 0.001
-_DEFAULT_THRESHOLD = 0.45
+_DEFAULT_THRESHOLD = 0.3
 _DEFAULT_STEPS = 1
-_DEFAULT_MIN_SIGMA = 2.0
+_DEFAULT_MIN_SIGMA = 1.5
+_DEFAULT_RULE = "flux_anomaly"
 
 
 # ---------------------------------------------------------------------------
@@ -90,29 +94,64 @@ class FileOutcome:
 # CA pipeline tuned for single-frame ms-echo hits
 # ---------------------------------------------------------------------------
 
-def build_bio_pipeline(steps: int, threshold: float, min_sigma: float) -> Pipeline:
-    """Build a CA pipeline that fires on single-frame anomalies.
+#: Named CA rule chains. All share the same tight GroupingRule
+#: (single-frame / single-cell) so any surviving activation fires. Pick with
+#: ``--rule``; sensitivity knobs like ``--min-sigma`` apply where relevant.
+RULE_PRESETS: tuple[str, ...] = (
+    "anomaly",         # WolframRule(90) | AnomalyDetectionRule
+    "flux",            # SpectralFluxRule (per-bin onset energy)
+    "flux_anomaly",    # SpectralFluxRule | AnomalyDetectionRule
+    "outlier",         # LocalOutlierRule (median + MAD)
+    "edge_anomaly",    # EdgeGatedAnomalyRule (edge-gated anomaly)
+)
 
-    Differs from :func:`hp_ca.build_pipeline` in the grouping stage:
-    ``min_frame_span=1`` and ``min_cells=1`` mean a single active cell in a
-    single frame produces a detection, which is what a sub-millisecond echo
-    typically looks like at 1 ms/frame resolution.
+
+def _tight_grouping() -> GroupingRule:
+    """Grouping tuned for single-frame single-cell transient hits."""
+    return GroupingRule(min_cells=1, min_frame_span=1, min_bin_span=1)
+
+
+def build_bio_pipeline(rule_name: str, steps: int, threshold: float,
+                       min_sigma: float) -> Pipeline:
+    """Build a CA pipeline for one of :data:`RULE_PRESETS`.
+
+    All presets end in the tight :func:`_tight_grouping` so a single active
+    cell in a single frame produces a detection — appropriate for
+    sub-millisecond echoes at 1 ms/frame resolution.
 
     Args:
-        steps: CA evolution steps (default kept low so single-frame hits
-            survive without being spread across neighbours).
+        rule_name: One of :data:`RULE_PRESETS`.
+        steps: CA evolution steps (only used by presets containing
+            :class:`WolframRule`; kept low so single-frame hits survive).
         threshold: Per-frame score threshold in [0, 1].
-        min_sigma: Local z-score cutoff for :class:`AnomalyDetectionRule`.
+        min_sigma: Local z-score cutoff for :class:`AnomalyDetectionRule`
+            (used by ``anomaly`` and ``flux_anomaly``) and for the anomaly
+            side of ``edge_anomaly``.
 
     Returns:
         A configured :class:`brahma_cellular.Pipeline`.
+
+    Raises:
+        ValueError: If ``rule_name`` is not one of :data:`RULE_PRESETS`.
     """
-    rule = (
-        WolframRule(rule_number=90, steps=steps)
-        | AnomalyDetectionRule(min_sigma=min_sigma)
-        | GroupingRule(min_cells=1, min_frame_span=1, min_bin_span=1)
-    )
-    return Pipeline(rule=rule, model_name=MODEL_NAME,
+    if rule_name == "anomaly":
+        chain = (WolframRule(rule_number=90, steps=steps)
+                 | AnomalyDetectionRule(min_sigma=min_sigma)
+                 | _tight_grouping())
+    elif rule_name == "flux":
+        chain = SpectralFluxRule() | _tight_grouping()
+    elif rule_name == "flux_anomaly":
+        chain = (SpectralFluxRule()
+                 | AnomalyDetectionRule(min_sigma=min_sigma)
+                 | _tight_grouping())
+    elif rule_name == "outlier":
+        chain = LocalOutlierRule() | _tight_grouping()
+    elif rule_name == "edge_anomaly":
+        chain = EdgeGatedAnomalyRule(anomaly_min_sigma=min_sigma) | _tight_grouping()
+    else:
+        raise ValueError(f"unknown --rule {rule_name!r}; "
+                         f"choose from {RULE_PRESETS}")
+    return Pipeline(rule=chain, model_name=MODEL_NAME,
                     steps=steps, threshold=threshold, label=True)
 
 
@@ -138,6 +177,7 @@ def _stage(rel: str, msg: str, since: float | None = None) -> float:
 def process_file(path: str, folder: str, root: str,
                  fmin: float, fmax: float, desired_delta_t: float,
                  threshold: float, steps: int, min_sigma: float,
+                 rule_name: str,
                  render: bool, evolve_steps: int | None,
                  ) -> tuple[FileOutcome, list | None]:
     """Run the ms-echo CA on one file; render its CA evolution.
@@ -166,9 +206,10 @@ def process_file(path: str, folder: str, root: str,
                         f"hop={actual_hop} ({actual_dt * 1000:.2f} ms/frame)",
                    since=t)
 
-        pipeline = build_bio_pipeline(steps=steps, threshold=threshold,
-                                      min_sigma=min_sigma)
-        t = _stage(rel, f"evolving CA ({steps} steps, min_sigma={min_sigma})")
+        pipeline = build_bio_pipeline(rule_name=rule_name, steps=steps,
+                                      threshold=threshold, min_sigma=min_sigma)
+        t = _stage(rel, f"evolving CA [rule={rule_name}, steps={steps}, "
+                        f"min_sigma={min_sigma}]")
         result = pipeline.run(band_fourier)
         result.pop("_ca", None)
         detections = result["detections"]
@@ -194,8 +235,7 @@ def process_file(path: str, folder: str, root: str,
                     "run_id": run_id,
                     "band_hz": [fmin, fmax],
                     "model": MODEL_NAME,
-                    "rule": "WolframRule(90) | AnomalyDetectionRule | "
-                            "GroupingRule(min_frame_span=1, min_cells=1)",
+                    "rule": rule_name,
                 },
             )
             _stage(rel, "rendered", since=t)
@@ -219,6 +259,7 @@ def run_bio(target: str,
             threshold: float = _DEFAULT_THRESHOLD,
             steps: int = _DEFAULT_STEPS,
             min_sigma: float = _DEFAULT_MIN_SIGMA,
+            rule_name: str = _DEFAULT_RULE,
             render: bool = True, evolve_steps: int | None = None,
             limit: int | None = None, max_size_mb: float | None = None,
             output_root: str | None = None,
@@ -249,7 +290,7 @@ def run_bio(target: str,
 
     print(f"[anom_bio] folder={folder!r} files={len(files)} -> root={root!r} "
           f"band={band_label} delta_t={desired_delta_t}s threshold={threshold} "
-          f"steps={steps} min_sigma={min_sigma}")
+          f"rule={rule_name} steps={steps} min_sigma={min_sigma}")
 
     outcomes: list[FileOutcome] = []
     n_sidecars = 0
@@ -278,7 +319,7 @@ def run_bio(target: str,
         outcome, dets = process_file(
             path, folder, root,
             fmin, fmax, desired_delta_t, threshold, steps, min_sigma,
-            render, evolve_steps)
+            rule_name, render, evolve_steps)
         outcomes.append(outcome)
         gc.collect()
 
@@ -304,6 +345,7 @@ def run_bio(target: str,
         "threshold": threshold,
         "steps": steps,
         "min_sigma": min_sigma,
+        "rule": rule_name,
         "n_files": len(outcomes),
         "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
         "n_failed": sum(1 for o in outcomes if o.error and not o.error.startswith("skipped:")),
@@ -348,6 +390,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    dest="min_sigma",
                    help=f"anomaly z-score cutoff for the CA "
                         f"(default: {_DEFAULT_MIN_SIGMA})")
+    p.add_argument("--rule", default=_DEFAULT_RULE, choices=RULE_PRESETS,
+                   dest="rule_name",
+                   help=f"CA rule chain preset (default: {_DEFAULT_RULE}). "
+                        f"anomaly = WolframRule(90) + AnomalyDetectionRule; "
+                        f"flux = SpectralFluxRule (best for click onsets); "
+                        f"flux_anomaly = SpectralFluxRule + AnomalyDetectionRule; "
+                        f"outlier = LocalOutlierRule (median + MAD); "
+                        f"edge_anomaly = EdgeGatedAnomalyRule.")
     p.add_argument("--evolve-steps", type=int, default=None,
                    help="CA generations to render (default: same as --steps)")
     p.add_argument("--limit", type=int, default=None,
@@ -375,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold=args.threshold,
             steps=args.steps,
             min_sigma=args.min_sigma,
+            rule_name=args.rule_name,
             evolve_steps=args.evolve_steps,
             render=args.render,
             limit=args.limit,

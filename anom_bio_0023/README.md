@@ -23,7 +23,8 @@ transient echoes:
 | CA `steps` | 3 | **1** (low so single-frame hits don't smear) |
 | Default band | 100–150 kHz | **100–140 kHz** |
 | Default `delta-t` | 0.001 s | **0.001 s** |
-| `min_sigma` (anomaly z-score) | 1.5 | **2.0** |
+| `min_sigma` (anomaly z-score) | 1.5 | **1.5** |
+| Default rule chain | `WolframRule(90) → AnomalyDetectionRule` | **`SpectralFluxRule → AnomalyDetectionRule`** (`--rule flux_anomaly`) |
 
 ## Requirements
 
@@ -69,15 +70,37 @@ python anom_bio_0023.py /data/hydrophone --no-render
 | `--fmin HZ` | `100000` | Lower frequency band edge in Hz |
 | `--fmax HZ` | `140000` | Upper frequency band edge in Hz |
 | `--delta-t SECONDS` | `0.001` | Target time resolution between STFT frames; passed to the SDK as `desired_delta_t` |
-| `--threshold` | `0.45` | Detection score threshold in [0, 1] |
+| `--threshold` | `0.3` | Detection score threshold in [0, 1] |
 | `--steps` | `1` | CA evolution steps (kept low so single-frame hits don't smear across neighbours) |
-| `--min-sigma` | `2.0` | Anomaly z-score cutoff for `AnomalyDetectionRule` |
+| `--min-sigma` | `1.5` | Anomaly z-score cutoff for `AnomalyDetectionRule` (used by `anomaly`, `flux_anomaly`, `edge_anomaly`) |
+| `--rule` | `flux_anomaly` | CA rule chain preset — see below |
 | `--evolve-steps N` | *(same as --steps)* | CA generations to render (visualization only) |
 | `--limit N` | *(all)* | Process at most N files that pass the size cap (folder mode) |
 | `--max-size-mb MB` | *(no cap)* | Skip files larger than this (folder mode) |
 | `--output-root PATH` | *(random)* | Explicit output folder for render bundles; defaults to `anom_bio_out<rand>` |
 | `--no-render` | — | Skip CA evolution render bundles (decisions only) |
 | `--dry-run` | — | Score and render but do not write decision sidecars |
+
+## `--rule` presets
+
+All presets end with a tight `GroupingRule(min_cells=1, min_frame_span=1, min_bin_span=1)` so single-cell / single-frame activations survive as detections. Pick the one that best matches the signal you're hunting:
+
+| Preset | Chain | Best for |
+|---|---|---|
+| `anomaly` | `WolframRule(90) → AnomalyDetectionRule → Grouping` | Harmonic / tonal content; slow-varying textures |
+| `flux` | `SpectralFluxRule → Grouping` | **Sharp onsets** — click transients light up per-bin energy jumps |
+| `flux_anomaly` *(default)* | `SpectralFluxRule → AnomalyDetectionRule → Grouping` | Onsets that also stand out statistically from local background |
+| `outlier` | `LocalOutlierRule → Grouping` | Cells above local median + `k·MAD`; robust to steady noise |
+| `edge_anomaly` | `EdgeGatedAnomalyRule → Grouping` | Anomalies located on spectral/temporal edges (both bright *and* transient) |
+
+### Which to try first for porpoise clicks
+
+Porpoise clicks are extremely short broadband-ish pulses. Onset energy is the strongest signal:
+
+1. `flux_anomaly` (default) — should be the most sensitive out of the box.
+2. `flux` — if `flux_anomaly` is too strict (anomaly requires background contrast that a quiet click may not exceed).
+3. `outlier` — robust alternative if the recording has a lot of steady tonal noise that anomaly/flux both react to.
+4. `edge_anomaly` — for cleaner recordings where clicks are the only sharp transients.
 
 ## Output
 
