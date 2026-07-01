@@ -116,48 +116,57 @@ def _tight_grouping() -> GroupingRule:
     return GroupingRule(min_cells=1, min_frame_span=1, min_bin_span=1)
 
 
-def build_bio_pipeline(rule_name: str, steps: int, threshold: float,
-                       min_sigma: float) -> Pipeline:
-    """Build a CA pipeline for one of :data:`RULE_PRESETS`.
+def _rule_chain_for(rule_name: str, steps: int, min_sigma: float,
+                     with_grouping: bool):
+    """Return the rule chain for one preset, with/without the final grouping.
 
-    All presets end in the tight :func:`_tight_grouping` so a single active
-    cell in a single frame produces a detection — appropriate for
-    sub-millisecond echoes at 1 ms/frame resolution.
-
-    Args:
-        rule_name: One of :data:`RULE_PRESETS`.
-        steps: CA evolution steps (only used by presets containing
-            :class:`WolframRule`; kept low so single-frame hits survive).
-        threshold: Per-frame score threshold in [0, 1].
-        min_sigma: Local z-score cutoff for :class:`AnomalyDetectionRule`
-            (used by ``anomaly`` and ``flux_anomaly``) and for the anomaly
-            side of ``edge_anomaly``.
-
-    Returns:
-        A configured :class:`brahma_cellular.Pipeline`.
-
-    Raises:
-        ValueError: If ``rule_name`` is not one of :data:`RULE_PRESETS`.
+    The version *with* grouping is used to produce detections (the tight
+    single-frame / single-cell filter). The version *without* grouping is
+    used to compute the score curve — otherwise the state after grouping
+    is so sparse that ``max(axis=1)`` is 0 at nearly every frame and the
+    score-vs-time plot looks flat.
     """
     if rule_name == "anomaly":
         chain = (WolframRule(rule_number=90, steps=steps)
-                 | AnomalyDetectionRule(min_sigma=min_sigma)
-                 | _tight_grouping())
+                 | AnomalyDetectionRule(min_sigma=min_sigma))
     elif rule_name == "flux":
-        chain = SpectralFluxRule() | _tight_grouping()
+        chain = SpectralFluxRule()
     elif rule_name == "flux_anomaly":
         chain = (SpectralFluxRule()
-                 | AnomalyDetectionRule(min_sigma=min_sigma)
-                 | _tight_grouping())
+                 | AnomalyDetectionRule(min_sigma=min_sigma))
     elif rule_name == "outlier":
-        chain = LocalOutlierRule() | _tight_grouping()
+        chain = LocalOutlierRule()
     elif rule_name == "edge_anomaly":
-        chain = EdgeGatedAnomalyRule(anomaly_min_sigma=min_sigma) | _tight_grouping()
+        chain = EdgeGatedAnomalyRule(anomaly_min_sigma=min_sigma)
     else:
         raise ValueError(f"unknown --rule {rule_name!r}; "
                          f"choose from {RULE_PRESETS}")
+    if with_grouping:
+        chain = chain | _tight_grouping()
+    return chain
+
+
+def build_bio_pipeline(rule_name: str, steps: int, threshold: float,
+                       min_sigma: float) -> Pipeline:
+    """Build a CA pipeline for one of :data:`RULE_PRESETS` (with grouping)."""
+    chain = _rule_chain_for(rule_name, steps, min_sigma, with_grouping=True)
     return Pipeline(rule=chain, model_name=MODEL_NAME,
                     steps=steps, threshold=threshold, label=True)
+
+
+def build_score_pipeline(rule_name: str, steps: int, threshold: float,
+                          min_sigma: float) -> Pipeline:
+    """Build a scoring-only pipeline (same rules minus the grouping filter).
+
+    Used exclusively to compute the score-vs-time curve written to the
+    ``.scores.json`` sidecar. Skipping :class:`GroupingRule` keeps the
+    per-bin anomaly / flux mask intact, so ``state.max(axis=1)`` gives a
+    non-trivial value at every frame the detector reacted to — not just
+    the frames that survived the tight grouping filter.
+    """
+    chain = _rule_chain_for(rule_name, steps, min_sigma, with_grouping=False)
+    return Pipeline(rule=chain, model_name=MODEL_NAME,
+                    steps=steps, threshold=threshold, label=False)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +233,16 @@ def process_file(path: str, folder: str, root: str,
             det["fmin"] = fmin
             det["fmax"] = fmax
 
+        # Compute the score curve on the ungrouped pipeline so it reflects
+        # the raw anomaly/flux mask rather than the sparse post-grouping
+        # label state (which would leave the curve near-zero everywhere).
+        score_pipeline = build_score_pipeline(
+            rule_name=rule_name, steps=steps,
+            threshold=threshold, min_sigma=min_sigma)
+        score_result = score_pipeline.run(band_fourier)
+        score_result.pop("_ca", None)
+        score_curve = score_result["scores"]
+
         run_id = new_run_id(MODEL_NAME)
         outcome.run_id = run_id
         outcome.n_frames = len(result["scores"])
@@ -254,7 +273,7 @@ def process_file(path: str, folder: str, root: str,
         # on the result, that's ground truth; otherwise fall back to the
         # value we configured it with.
         effective_threshold = float(result.get("threshold", threshold))
-        extras = {"scores": result["scores"], "stft": stft_info,
+        extras = {"scores": score_curve, "stft": stft_info,
                   "threshold": effective_threshold}
         return outcome, detections, extras
     except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
