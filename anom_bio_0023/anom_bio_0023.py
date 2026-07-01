@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# Vixen Intelligence c.2026
+
+"""anom_bio_0023 — CA tuned for single-frame ms-echo hits in local audio.
+
+Walks a local folder of WAVs and runs a cellular-automata pipeline aimed at
+short (millisecond-scale) transient echoes in the 100-140 kHz band -- e.g.
+harbour porpoise clicks. Unlike the general hp_local_big_data_ca, this
+pipeline is configured so single-frame anomalies register as detections
+(GroupingRule with min_frame_span=1, min_cells=1), so a tight burst that
+spans only one STFT frame still fires.
+
+Decisions are written next to each audio file as a merge-safe
+``<base>.decisions.json`` sidecar (multiple models accumulate; existing
+records from other models are preserved). A per-file CA evolution bundle is
+optionally written under one random ``anom_bio_out<rand>/`` root so the app
+can visualize the CA grid.
+
+Usage::
+
+    python anom_bio_0023.py /path/to/audio
+    python anom_bio_0023.py /path/to/audio --fmin 110000 --fmax 130000
+    python anom_bio_0023.py /path/to/audio --delta-t 0.001 --min-sigma 2.5
+    python anom_bio_0023.py /path/to/audio --limit 5 --dry-run
+    python anom_bio_0023.py /path/to/audio --no-render        # decisions only
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass
+
+# Resolve hp_games helpers from the sibling folder.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hp_games"))
+
+from brahma_cellular import (
+    Pipeline,
+    WolframRule,
+    AnomalyDetectionRule,
+    GroupingRule,
+)
+from identdynamics import ApiError, list_local_audio_files
+from hp_ca import (
+    crop_fourier_band,
+    new_run_id,
+    render_evolution,
+    write_decisions_sidecar,
+)
+from hp_local_big_data_ca import fourier_for_local
+
+#: Model label written into decision sidecars as the ``signature`` field.
+MODEL_NAME = "anom_bio_0023"
+
+#: Prefix for the random per-invocation output folder.
+OUTPUT_PREFIX = "anom_bio_out"
+
+_DEFAULT_FMIN = 100_000.0
+_DEFAULT_FMAX = 140_000.0
+_DEFAULT_DELTA_T = 0.001
+_DEFAULT_THRESHOLD = 0.45
+_DEFAULT_STEPS = 1
+_DEFAULT_MIN_SIGMA = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FileOutcome:
+    """Result of running the CA on one local file."""
+
+    file: str
+    path: str
+    out_dir: str
+    run_id: str | None = None
+    n_frames: int = 0
+    n_detections: int = 0
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# CA pipeline tuned for single-frame ms-echo hits
+# ---------------------------------------------------------------------------
+
+def build_bio_pipeline(steps: int, threshold: float, min_sigma: float) -> Pipeline:
+    """Build a CA pipeline that fires on single-frame anomalies.
+
+    Differs from :func:`hp_ca.build_pipeline` in the grouping stage:
+    ``min_frame_span=1`` and ``min_cells=1`` mean a single active cell in a
+    single frame produces a detection, which is what a sub-millisecond echo
+    typically looks like at 1 ms/frame resolution.
+
+    Args:
+        steps: CA evolution steps (default kept low so single-frame hits
+            survive without being spread across neighbours).
+        threshold: Per-frame score threshold in [0, 1].
+        min_sigma: Local z-score cutoff for :class:`AnomalyDetectionRule`.
+
+    Returns:
+        A configured :class:`brahma_cellular.Pipeline`.
+    """
+    rule = (
+        WolframRule(rule_number=90, steps=steps)
+        | AnomalyDetectionRule(min_sigma=min_sigma)
+        | GroupingRule(min_cells=1, min_frame_span=1, min_bin_span=1)
+    )
+    return Pipeline(rule=rule, model_name=MODEL_NAME,
+                    steps=steps, threshold=threshold, label=True)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _new_output_root() -> str:
+    return f"{OUTPUT_PREFIX}{uuid.uuid4().hex[:8]}"
+
+
+def _stage(rel: str, msg: str, since: float | None = None) -> float:
+    now = time.perf_counter()
+    extra = f" [{now - since:.1f}s]" if since is not None else ""
+    print(f"[anom_bio]   {rel}: {msg}{extra}", flush=True)
+    return now
+
+
+# ---------------------------------------------------------------------------
+# Per-file processing
+# ---------------------------------------------------------------------------
+
+def process_file(path: str, folder: str, root: str,
+                 fmin: float, fmax: float, desired_delta_t: float,
+                 threshold: float, steps: int, min_sigma: float,
+                 render: bool, evolve_steps: int | None,
+                 ) -> tuple[FileOutcome, list | None]:
+    """Run the ms-echo CA on one file; render its CA evolution.
+
+    Returns:
+        ``(outcome, detections)`` — detections is ``None`` on error.
+    """
+    name = os.path.basename(path)
+    rel = os.path.relpath(path, folder)
+    stem = os.path.splitext(name)[0]
+    out_dir = os.path.join(root, stem)
+    outcome = FileOutcome(file=name, path=rel, out_dir=out_dir)
+    size_mb = os.path.getsize(path) / 1e6
+
+    try:
+        t = _stage(rel, f"decoding + STFT ({size_mb:.0f} MB)")
+        fourier = fourier_for_local(path, desired_delta_t=desired_delta_t)
+        stft_info = fourier.get("stft", {})
+        actual_hop = stft_info.get("hop", 0)
+        actual_sr = stft_info.get("sample_rate", fourier.get("sample_rate", 0))
+        actual_dt = (actual_hop / actual_sr) if actual_sr else 0.0
+
+        band_fourier = crop_fourier_band(fourier, fmin, fmax)
+        t = _stage(rel, f"{fourier['frames']} frames x {fourier['bins']} bins "
+                        f"-> band {fmin:.0f}-{fmax:.0f} Hz ({band_fourier['bins']} bins), "
+                        f"hop={actual_hop} ({actual_dt * 1000:.2f} ms/frame)",
+                   since=t)
+
+        pipeline = build_bio_pipeline(steps=steps, threshold=threshold,
+                                      min_sigma=min_sigma)
+        t = _stage(rel, f"evolving CA ({steps} steps, min_sigma={min_sigma})")
+        result = pipeline.run(band_fourier)
+        result.pop("_ca", None)
+        detections = result["detections"]
+        for det in detections:
+            det["fmin"] = fmin
+            det["fmax"] = fmax
+
+        run_id = new_run_id(MODEL_NAME)
+        outcome.run_id = run_id
+        outcome.n_frames = len(result["scores"])
+        outcome.n_detections = len(detections)
+        t = _stage(rel, f"{outcome.n_detections} detections", since=t)
+
+        if render:
+            t = _stage(rel, "rendering CA evolution")
+            render_evolution(
+                band_fourier,
+                evolve_steps if evolve_steps is not None else steps,
+                out_dir,
+                source={
+                    "folder": folder,
+                    "file": rel,
+                    "run_id": run_id,
+                    "band_hz": [fmin, fmax],
+                    "model": MODEL_NAME,
+                    "rule": "WolframRule(90) | AnomalyDetectionRule | "
+                            "GroupingRule(min_frame_span=1, min_cells=1)",
+                },
+            )
+            _stage(rel, "rendered", since=t)
+
+        print(f"[anom_bio] {rel}: {outcome.n_detections} detections, "
+              f"run_id={run_id}", flush=True)
+        return outcome, detections
+    except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
+        outcome.error = f"{type(exc).__name__}: {exc}"
+        print(f"[anom_bio] {rel}: ERROR {outcome.error}")
+        return outcome, None
+
+
+# ---------------------------------------------------------------------------
+# Batch runner
+# ---------------------------------------------------------------------------
+
+def run_bio(folder: str,
+            fmin: float = _DEFAULT_FMIN, fmax: float = _DEFAULT_FMAX,
+            desired_delta_t: float = _DEFAULT_DELTA_T,
+            threshold: float = _DEFAULT_THRESHOLD,
+            steps: int = _DEFAULT_STEPS,
+            min_sigma: float = _DEFAULT_MIN_SIGMA,
+            render: bool = True, evolve_steps: int | None = None,
+            limit: int | None = None, max_size_mb: float | None = None,
+            output_root: str | None = None,
+            dry_run: bool = False) -> tuple[str, list[FileOutcome]]:
+    """Score every WAV in a local folder with the ms-echo CA."""
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(folder)
+
+    files = list_local_audio_files(folder)
+    files = [p for p in files if not os.path.basename(p).startswith("._")]
+
+    root = output_root or _new_output_root()
+    os.makedirs(root, exist_ok=True)
+
+    band_label = f"{int(fmin)}-{int(fmax)} Hz"
+    cap_bytes = int(max_size_mb * 1024 * 1024) if max_size_mb else None
+
+    print(f"[anom_bio] folder={folder!r} files={len(files)} -> root={root!r} "
+          f"band={band_label} delta_t={desired_delta_t}s threshold={threshold} "
+          f"steps={steps} min_sigma={min_sigma}")
+
+    outcomes: list[FileOutcome] = []
+    n_sidecars = 0
+    n_processed = 0
+
+    for path in files:
+        rel = os.path.relpath(path, folder)
+        size_mb = os.path.getsize(path) / 1e6
+
+        if cap_bytes is not None and os.path.getsize(path) > cap_bytes:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            skipped = FileOutcome(
+                file=os.path.basename(path), path=rel,
+                out_dir=os.path.join(root, stem),
+                error=f"skipped: {size_mb:.0f} MB > {max_size_mb:.0f} MB cap")
+            print(f"[anom_bio] {rel}: {skipped.error}")
+            outcomes.append(skipped)
+            continue
+
+        if limit is not None and n_processed >= limit:
+            break
+        n_processed += 1
+        print(f"[anom_bio] ({n_processed}{f'/{limit}' if limit else ''}) "
+              f"{rel} ({size_mb:.0f} MB)")
+
+        outcome, dets = process_file(
+            path, folder, root,
+            fmin, fmax, desired_delta_t, threshold, steps, min_sigma,
+            render, evolve_steps)
+        outcomes.append(outcome)
+        gc.collect()
+
+        if dets and not dry_run:
+            try:
+                write_decisions_sidecar(
+                    os.path.dirname(path), os.path.basename(path),
+                    MODEL_NAME, (fmin, fmax), dets)
+                n_sidecars += 1
+            except OSError as exc:
+                print(f"[anom_bio] {rel}: sidecar write failed: {exc}")
+
+    if dry_run:
+        print(f"[anom_bio] dry-run: sidecars skipped")
+    else:
+        print(f"[anom_bio] wrote {n_sidecars} decision sidecar(s) into {folder}")
+
+    index = {
+        "folder": folder,
+        "model_name": MODEL_NAME,
+        "band_hz": [fmin, fmax],
+        "desired_delta_t": desired_delta_t,
+        "threshold": threshold,
+        "steps": steps,
+        "min_sigma": min_sigma,
+        "n_files": len(outcomes),
+        "n_skipped": sum(1 for o in outcomes if o.error and o.error.startswith("skipped:")),
+        "n_failed": sum(1 for o in outcomes if o.error and not o.error.startswith("skipped:")),
+        "n_sidecars": n_sidecars,
+        "files": [asdict(o) for o in outcomes],
+    }
+    with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as fh:
+        json.dump(index, fh, indent=2)
+    print(f"[anom_bio] done: {index['n_files']} files, "
+          f"{index['n_skipped']} skipped, {index['n_failed']} failed "
+          f"-> {root}/index.json")
+    return root, outcomes
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=f"Run {MODEL_NAME} (single-frame ms-echo CA) over a local "
+                    f"audio folder; write decision sidecars into the folder.")
+    p.add_argument("folder", help="local folder of audio to process")
+    p.add_argument("--fmin", type=float, default=_DEFAULT_FMIN,
+                   help=f"lower frequency band edge in Hz (default: {_DEFAULT_FMIN:.0f})")
+    p.add_argument("--fmax", type=float, default=_DEFAULT_FMAX,
+                   help=f"upper frequency band edge in Hz (default: {_DEFAULT_FMAX:.0f})")
+    p.add_argument("--delta-t", type=float, default=_DEFAULT_DELTA_T,
+                   dest="desired_delta_t", metavar="SECONDS",
+                   help=f"target time resolution between frames in seconds; "
+                        f"hop = round(delta_t * sample_rate) "
+                        f"(default: {_DEFAULT_DELTA_T}s)")
+    p.add_argument("--threshold", type=float, default=_DEFAULT_THRESHOLD,
+                   help=f"detection score threshold in [0, 1] "
+                        f"(default: {_DEFAULT_THRESHOLD})")
+    p.add_argument("--steps", type=int, default=_DEFAULT_STEPS,
+                   help=f"CA evolution steps; keep low so single-frame hits "
+                        f"survive (default: {_DEFAULT_STEPS})")
+    p.add_argument("--min-sigma", type=float, default=_DEFAULT_MIN_SIGMA,
+                   dest="min_sigma",
+                   help=f"anomaly z-score cutoff for the CA "
+                        f"(default: {_DEFAULT_MIN_SIGMA})")
+    p.add_argument("--evolve-steps", type=int, default=None,
+                   help="CA generations to render (default: same as --steps)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="process at most N files under the size cap (default: all)")
+    p.add_argument("--max-size-mb", type=float, default=None,
+                   help="skip files larger than this many MB (default: no cap)")
+    p.add_argument("--output-root", default=None,
+                   help=f"explicit output folder (default: random {OUTPUT_PREFIX}<rand>)")
+    p.add_argument("--no-render", dest="render", action="store_false",
+                   help="skip writing CA evolution render bundles")
+    p.add_argument("--dry-run", action="store_true",
+                   help="score and render but do not write decision sidecars")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Script entry point. Returns a process exit code."""
+    args = _parse_args(argv)
+    try:
+        run_bio(
+            folder=args.folder,
+            fmin=args.fmin,
+            fmax=args.fmax,
+            desired_delta_t=args.desired_delta_t,
+            threshold=args.threshold,
+            steps=args.steps,
+            min_sigma=args.min_sigma,
+            evolve_steps=args.evolve_steps,
+            render=args.render,
+            limit=args.limit,
+            max_size_mb=args.max_size_mb,
+            output_root=args.output_root,
+            dry_run=args.dry_run,
+        )
+    except (ApiError, NotADirectoryError, ValueError) as exc:
+        print(f"[anom_bio] error: {type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
