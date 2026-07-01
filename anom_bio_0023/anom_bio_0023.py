@@ -249,7 +249,13 @@ def process_file(path: str, folder: str, root: str,
 
         print(f"[anom_bio] {rel}: {outcome.n_detections} detections, "
               f"run_id={run_id}", flush=True)
-        extras = {"scores": result["scores"], "stft": stft_info}
+        # Carry the effective threshold so both sidecars agree on the value
+        # that classified frames into detections. If the pipeline exposes it
+        # on the result, that's ground truth; otherwise fall back to the
+        # value we configured it with.
+        effective_threshold = float(result.get("threshold", threshold))
+        extras = {"scores": result["scores"], "stft": stft_info,
+                  "threshold": effective_threshold}
         return outcome, detections, extras
     except Exception as exc:  # noqa: BLE001 -- never let one file abort the batch
         outcome.error = f"{type(exc).__name__}: {exc}"
@@ -341,14 +347,17 @@ def run_bio(target: str,
             except OSError as exc:
                 print(f"[anom_bio] {rel}: decision sidecar write failed: {exc}")
 
-        # Score-vs-time sidecar for the app's "score vs time" plot. Written even
-        # when there are zero detections so the curve is still viewable.
+        # Score-vs-time sidecar for the app's "score vs time" plot. Written
+        # even when there are zero detections so the curve is still viewable.
+        # Uses the effective threshold surfaced by process_file so this
+        # sidecar's threshold matches the one that produced the detections
+        # written above.
         if not dry_run and extras is not None:
             try:
                 save_scores_local(os.path.dirname(path), [{
                     "name": os.path.basename(path),
                     "scores": extras["scores"],
-                    "threshold": threshold,
+                    "threshold": extras["threshold"],
                     "stft": extras["stft"],
                     "fmin": fmin, "fmax": fmax,
                     "model_name": MODEL_NAME,
