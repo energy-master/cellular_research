@@ -3,22 +3,24 @@
 
 """anom_bio_0023 — CA tuned for single-frame ms-echo hits in local audio.
 
-Walks a local folder of WAVs and runs a cellular-automata pipeline aimed at
-short (millisecond-scale) transient echoes in the 100-140 kHz band -- e.g.
-harbour porpoise clicks. Unlike the general hp_local_big_data_ca, this
-pipeline is configured so single-frame anomalies register as detections
-(GroupingRule with min_frame_span=1, min_cells=1), so a tight burst that
-spans only one STFT frame still fires.
+Runs a cellular-automata pipeline aimed at short (millisecond-scale)
+transient echoes in the 100-140 kHz band — e.g. harbour porpoise clicks —
+against either a single WAV or an entire folder. Unlike the general
+hp_local_big_data_ca, this pipeline is configured so single-frame
+anomalies register as detections (GroupingRule with ``min_frame_span=1``
+/ ``min_cells=1``), so a tight burst spanning only one STFT frame still
+fires.
 
 Decisions are written next to each audio file as a merge-safe
 ``<base>.decisions.json`` sidecar (multiple models accumulate; existing
-records from other models are preserved). A per-file CA evolution bundle is
-optionally written under one random ``anom_bio_out<rand>/`` root so the app
-can visualize the CA grid.
+records from other models are preserved). A per-file CA evolution bundle
+is optionally written under one random ``anom_bio_out<rand>/`` root so
+the app can visualize the CA grid.
 
 Usage::
 
-    python anom_bio_0023.py /path/to/audio
+    python anom_bio_0023.py /path/to/audio                    # a folder
+    python anom_bio_0023.py /path/to/file.wav                 # one file
     python anom_bio_0023.py /path/to/audio --fmin 110000 --fmax 130000
     python anom_bio_0023.py /path/to/audio --delta-t 0.001 --min-sigma 2.5
     python anom_bio_0023.py /path/to/audio --limit 5 --dry-run
@@ -45,14 +47,13 @@ from brahma_cellular import (
     AnomalyDetectionRule,
     GroupingRule,
 )
-from identdynamics import ApiError, list_local_audio_files
+from identdynamics import ApiError, fourier_for_path, list_local_audio_files
 from hp_ca import (
     crop_fourier_band,
     new_run_id,
     render_evolution,
     write_decisions_sidecar,
 )
-from hp_local_big_data_ca import fourier_for_local
 
 #: Model label written into decision sidecars as the ``signature`` field.
 MODEL_NAME = "anom_bio_0023"
@@ -153,7 +154,7 @@ def process_file(path: str, folder: str, root: str,
 
     try:
         t = _stage(rel, f"decoding + STFT ({size_mb:.0f} MB)")
-        fourier = fourier_for_local(path, desired_delta_t=desired_delta_t)
+        fourier = fourier_for_path(path, desired_delta_t=desired_delta_t)
         stft_info = fourier.get("stft", {})
         actual_hop = stft_info.get("hop", 0)
         actual_sr = stft_info.get("sample_rate", fourier.get("sample_rate", 0))
@@ -212,7 +213,7 @@ def process_file(path: str, folder: str, root: str,
 # Batch runner
 # ---------------------------------------------------------------------------
 
-def run_bio(folder: str,
+def run_bio(target: str,
             fmin: float = _DEFAULT_FMIN, fmax: float = _DEFAULT_FMAX,
             desired_delta_t: float = _DEFAULT_DELTA_T,
             threshold: float = _DEFAULT_THRESHOLD,
@@ -222,13 +223,23 @@ def run_bio(folder: str,
             limit: int | None = None, max_size_mb: float | None = None,
             output_root: str | None = None,
             dry_run: bool = False) -> tuple[str, list[FileOutcome]]:
-    """Score every WAV in a local folder with the ms-echo CA."""
-    folder = os.path.abspath(folder)
-    if not os.path.isdir(folder):
-        raise NotADirectoryError(folder)
+    """Score the ms-echo CA over a single WAV or every WAV in a folder.
 
-    files = list_local_audio_files(folder)
-    files = [p for p in files if not os.path.basename(p).startswith("._")]
+    ``target`` may be either a directory (all WAVs are processed, honouring
+    ``--limit`` and ``--max-size-mb``) or a single audio file. In the
+    single-file case, the sidecar is written next to that file and the
+    scanned "folder" recorded in the index is the file's parent directory.
+    """
+    target = os.path.abspath(target)
+    if os.path.isfile(target):
+        folder = os.path.dirname(target)
+        files = [target]
+    elif os.path.isdir(target):
+        folder = target
+        files = list_local_audio_files(target)
+        files = [p for p in files if not os.path.basename(p).startswith("._")]
+    else:
+        raise FileNotFoundError(target)
 
     root = output_root or _new_output_root()
     os.makedirs(root, exist_ok=True)
@@ -314,8 +325,10 @@ def run_bio(folder: str,
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=f"Run {MODEL_NAME} (single-frame ms-echo CA) over a local "
-                    f"audio folder; write decision sidecars into the folder.")
-    p.add_argument("folder", help="local folder of audio to process")
+                    f"audio folder or a single WAV; write decision sidecars "
+                    f"next to each audio file.")
+    p.add_argument("target",
+                   help="local folder OR a single audio file to process")
     p.add_argument("--fmin", type=float, default=_DEFAULT_FMIN,
                    help=f"lower frequency band edge in Hz (default: {_DEFAULT_FMIN:.0f})")
     p.add_argument("--fmax", type=float, default=_DEFAULT_FMAX,
@@ -355,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         run_bio(
-            folder=args.folder,
+            target=args.target,
             fmin=args.fmin,
             fmax=args.fmax,
             desired_delta_t=args.desired_delta_t,
@@ -369,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
             output_root=args.output_root,
             dry_run=args.dry_run,
         )
-    except (ApiError, NotADirectoryError, ValueError) as exc:
+    except (ApiError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"[anom_bio] error: {type(exc).__name__}: {exc}")
         return 1
     return 0
